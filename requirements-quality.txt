@@ -1,0 +1,5 @@
+# Quality-check dependencies for maintainers and CI.
+# The CLI itself (pi-keysmith.py) is zero-runtime-dependency stdlib-only.
+pytest>=7.0
+ruff>=0.5
+coverage>=7.0

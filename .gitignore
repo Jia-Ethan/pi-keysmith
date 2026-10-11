@@ -1,0 +1,18 @@
+# Build artifacts
+dist/
+dist-candidate/
+__pycache__/
+*.pyc
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+
+# Prompt-bank live reports
+work/
+*.jsonl
+
+# OS / editor
+.DS_Store
+*.swp

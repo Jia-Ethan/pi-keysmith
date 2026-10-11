@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.png binary
+*.zip binary
+*.tar.gz binary
+*.py text
+*.md text
+VERSION text

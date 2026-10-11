@@ -1,0 +1,38 @@
+---
+name: Bug report
+about: Report a defect in pi-keysmith
+labels: bug
+---
+
+## Summary
+
+Brief description of the defect.
+
+## Environment
+
+- pi-keysmith version (`pi-keysmith.py --version`):
+- Platform:
+- Python version:
+- pi version (`pi --version`), if relevant:
+
+## Reproduction
+
+Steps to reproduce:
+
+1.
+2.
+3.
+
+## Expected
+
+What you expected to happen.
+
+## Actual
+
+What happened instead.
+
+## Notes
+
+- Do not paste credentials, complete configurations, or private paths.
+- If the issue involves a transaction residue, preserve `.pi-keysmith-transaction-*`,
+  cleanup markers, and snapshots; do not delete them manually.
