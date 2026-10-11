@@ -9,6 +9,35 @@ Formal release status is established only when a source commit is bound to an
 immutable tag, a GitHub Release, and assets matching `SHA256SUMS`. A floating
 branch or embedded version string is not sufficient.
 
+## [0.2.0] — 2026-10-12
+
+### Added
+
+- `--json`: stdout is a single `pi-keysmith.envelope.v1` object for status,
+  deploy, uninstall, and recover (previews and confirms), including usage
+  errors. See `docs/json-contract.md`.
+- `--expected-preview-token`: binds a confirmed write to the preview's
+  `plan.confirmation_token`. Required for confirmed writes under `--json`.
+- State machine (`not-installed`, `conflict`, `recovery-required`, `drift`,
+  `active-aligned`) with deploy/uninstall blockers shared with the write path.
+- Directory lock `.pi-keysmith.lock` for confirmed writes; a held lock exits 5
+  without writing.
+- `--recover` now cleans orphan cleanup markers and interrupted
+  `.keysmith-*` temp files.
+
+### Changed
+
+- `--recover` on a terminal journal (`committed` / `recovered`) only finishes
+  cleanup. 0.1.0 rolled back a completed deploy when the process was killed
+  between commit and cleanup.
+- Uninstall now checks the previous-manifest backup fingerprint, not just its
+  existence (`manifest-backup-mismatch`).
+- `--status` reports the state and every blocker. Drift and a hand-written
+  `SYSTEM.md` remain exit 0.
+- Restoring from a backup or snapshot publishes through an atomic temp-file
+  replace.
+- `--dry-run --yes` is a preview.
+
 ## [0.1.0] — Unreleased
 
 ### Added
@@ -44,4 +73,5 @@ branch or embedded version string is not sufficient.
 - `main` / `Unreleased` is development state, not a formal Release.
 - Backups and uninstall archives are not automatically cleaned.
 
+[0.2.0]: https://github.com/Jia-Ethan/pi-keysmith/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Jia-Ethan/pi-keysmith/releases/tag/v0.1.0

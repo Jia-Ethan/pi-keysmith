@@ -13,7 +13,7 @@ JOURNAL_PREFIX = ".pi-keysmith-transaction-"
 
 
 def _run(args, **kw):
-    return subprocess.run([sys.executable, str(CLI_PATH), *args], capture_output=True, text=True, **kw)
+    return subprocess.run([sys.executable, str(CLI_PATH), *args], capture_output=True, text=True, encoding="utf-8", **kw)
 
 
 def _status(pi_agent: Path) -> str:
@@ -56,7 +56,7 @@ def test_recover_preview_does_not_modify(pi_agent):
 
 def test_recover_yes_restores_and_cleans_journal(pi_agent):
     original = "ORIGINAL-SYSTEM\n"
-    (pi_agent / SYSTEM_NAME).write_text(original, encoding="utf-8")
+    (pi_agent / SYSTEM_NAME).write_bytes(original.encode("utf-8"))
     _simulate_interrupted_deploy(pi_agent, original_content=original)
     proc = _run(["--pi-dir", str(pi_agent), "--recover", "--yes", "--lang", "en"])
     assert proc.returncode == 0, proc.stdout + proc.stderr

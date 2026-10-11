@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # ─── Version ──────────────────────────────────────────────────────────────────
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 VERSION = __version__
 
 # ─── Names and constants ─────────────────────────────────────────────────────
@@ -58,6 +58,7 @@ CLEANUP_MARKER_PREFIX = ".pi-keysmith-cleanup-"
 CLEANUP_MARKER_SUFFIX = ".intent.json"
 CLEANUP_CLAIM_SEPARATOR = ".cleanup-"
 RESIDUE_TEMP_PREFIX = ".keysmith-"
+LOCK_FILENAME = ".pi-keysmith.lock"
 DEFAULT_NAME = "system-prompt"
 PI_CONFIG_DIRNAME = ".pi"
 PI_AGENT_SUBDIR = "agent"
@@ -110,6 +111,24 @@ UNINSTALL_TERMINAL_PHASES = (PHASE_U_COMMITTED, PHASE_U_RECOVERED)
 
 OPERATION_DEPLOY = "deploy"
 OPERATION_UNINSTALL = "uninstall"
+OPERATION_RECOVER = "recover"
+OPERATION_STATUS = "status"
+
+# Machine-readable contract (`--json`). See docs/json-contract.md.
+ENVELOPE_SCHEMA = "pi-keysmith.envelope.v1"
+PREVIEW_TOKEN_SCHEMA = "pi-keysmith.preview-token.v1"
+EXIT_OK = 0
+EXIT_BLOCKED = 1
+EXIT_USAGE = 2
+EXIT_TOKEN_MISMATCH = 3
+EXIT_WRITE_FAILED = 4
+EXIT_LOCK_BUSY = 5
+STATE_NOT_INSTALLED = "not-installed"
+STATE_CONFLICT = "conflict"
+STATE_RECOVERY_REQUIRED = "recovery-required"
+STATE_DRIFT = "drift"
+STATE_ACTIVE_ALIGNED = "active-aligned"
+PRESERVED_PATHS = (APPEND_SYSTEM_FILENAME, AGENTS_FILENAME, CLAUDE_FILENAME, "settings.json", "models.json")
 
 # ─── Bundled system prompt (byte-identical to examples/system-prompt.md)
 BUILTIN_SYSTEM_PROMPT_MD = r"""You are Pi, an interactive CLI coding agent. You help the user complete
@@ -299,6 +318,11 @@ _STRINGS: Dict[str, Dict[str, str]] = {
         "zh-CN": "[卸载完成] 已撤销最新一层受管理部署。",
         "en": "[Uninstalled] Removed the newest managed deployment layer.",
     },
+    "state_label": {"zh-CN": "状态", "en": "State"},
+    "nothing_to_recover": {
+        "zh-CN": "[恢复] 没有需要恢复的残留，无操作。",
+        "en": "[Recover] No residue to recover; no-op.",
+    },
     "no_manifest_noop": {
         "zh-CN": "[卸载] 未找到 manifest，无操作。",
         "en": "[Uninstall] No manifest found; no-op.",
@@ -350,6 +374,12 @@ class IntegrityConflict(OSError):
     pass
 
 
+# Windows opens descriptors in text mode unless O_BINARY is set, which would
+# rewrite newlines and break byte-exact fingerprints.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
 def _is_regular_path(path: Path) -> bool:
     try:
         if os.path.islink(path):
@@ -379,7 +409,7 @@ def _sha256_bytes(data: bytes) -> str:
 def _read_regular_bytes_with_fingerprint(path: Path) -> Tuple[bytes, Dict[str, Any]]:
     fd = -1
     try:
-        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(str(path), os.O_RDONLY | _O_NOFOLLOW | _O_BINARY)
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise IntegrityConflict(f"{path}: not a regular file")
@@ -499,7 +529,7 @@ class _PosixFilesystem:
                 raise FilesystemError(f"{path}: chmod 0700 failed: {exc}") from exc
 
     def open_exclusive_private_file(self, path: Path) -> int:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_BINARY
         return os.open(str(path), flags, 0o600)
 
     def write_private_text(self, path: Path, content: str) -> None:
@@ -522,7 +552,9 @@ class _PosixFilesystem:
                 pass
 
     def atomic_write_text(self, path: Path, content: str, expected_fingerprint: Optional[Dict[str, Any]] = None) -> None:
-        data = content.encode("utf-8")
+        self.atomic_write_bytes(path, content.encode("utf-8"), expected_fingerprint)
+
+    def atomic_write_bytes(self, path: Path, data: bytes, expected_fingerprint: Optional[Dict[str, Any]] = None) -> None:
         parent = path.parent
         fd = -1
         tmp_path: Optional[Path] = None
@@ -588,22 +620,6 @@ class _PosixFilesystem:
                 except OSError:
                     pass
 
-    def atomic_move(self, source: Path, dest: Path, expected_fingerprint: Optional[Dict[str, Any]] = None) -> None:
-        """Atomically move `source` onto `dest`. Destination must be absent or
-        match `expected_fingerprint` (which may be None for 'must be absent')."""
-        if dest.is_symlink() or (dest.exists() and not _is_regular_path(dest)):
-            raise IntegrityConflict(f"{dest}: not a regular file; refuse to replace")
-        if not _is_regular_path(source):
-            raise IntegrityConflict(f"{source}: source must be a regular file")
-        if expected_fingerprint is None:
-            if dest.exists():
-                raise IntegrityConflict(f"{dest}: destination exists; no-replace move refused")
-        else:
-            if not _path_has_fingerprint(dest, expected_fingerprint):
-                raise IntegrityConflict(f"{dest}: current content does not match expected; concurrent drift refused")
-        os.replace(str(source), str(dest))
-        _fsync_directory(dest.parent)
-
     def remove_owned_file(self, path: Path, expected: Dict[str, Any]) -> None:
         if not _path_has_fingerprint(path, expected):
             raise IntegrityConflict(f"{path}: current content does not match expected; refuse to remove")
@@ -626,52 +642,12 @@ class _PosixFilesystem:
         elif dest.exists():
             raise IntegrityConflict(f"{dest}: destination exists; no-replace restore refused")
         data, _ = _read_regular_bytes_with_fingerprint(backup)
-        fd = -1
-        try:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-            fd = os.open(str(dest), flags, 0o600)
-            os.write(fd, data)
-            _fsync_fd(fd)
-        finally:
-            if fd >= 0:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-        if not _is_windows_platform():
-            try:
-                os.chmod(str(dest), 0o600)
-            except OSError:
-                pass
-        _fsync_directory(dest.parent)
+        # Publish through a temp file so an interruption never leaves a torn file.
+        self.atomic_write_bytes(dest, data)
 
     def write_snapshot(self, source: Path, dest: Path) -> None:
         """Copy `source` bytes into a snapshot file `dest` (exclusive, no-follow)."""
         self.copy_to_backup(source, dest)
-
-    def safe_remove_owned_directory(self, path: Path, expected_members: Dict[str, Optional[Dict[str, Any]]]) -> None:
-        """Remove a private directory after verifying its member set and fingerprints."""
-        try:
-            entries = sorted(os.listdir(str(path)))
-        except OSError as exc:
-            raise IntegrityConflict(f"{path}: cannot enumerate for cleanup: {exc}") from exc
-        expected_names = sorted(expected_members.keys())
-        if entries != expected_names:
-            raise IntegrityConflict(f"{path}: member set {entries} != expected {expected_names}")
-        for name, fp in expected_members.items():
-            member = path / name
-            if not _path_has_fingerprint(member, fp):
-                raise IntegrityConflict(f"{member}: fingerprint mismatch during cleanup")
-        for name in expected_names:
-            try:
-                os.unlink(str(path / name))
-            except OSError as exc:
-                raise IntegrityConflict(f"{path / name}: cannot remove during cleanup: {exc}") from exc
-        try:
-            os.rmdir(str(path))
-        except OSError as exc:
-            raise IntegrityConflict(f"{path}: cannot remove directory: {exc}") from exc
-        _fsync_directory(path.parent)
 
 
 _FILESYSTEM = _PosixFilesystem()
@@ -693,11 +669,6 @@ def _resolve_pi_dir(explicit: Optional[str]) -> Optional[Path]:
     return None
 
 
-def find_pi_dirs() -> List[str]:
-    resolved = _resolve_pi_dir(None)
-    return [str(resolved)] if resolved is not None else []
-
-
 def _classify_node(path: Path) -> str:
     if os.path.islink(path):
         return "symlink"
@@ -711,16 +682,17 @@ def _classify_node(path: Path) -> str:
     return "special"
 
 
-def _node_desc(label: str, path: Path) -> str:
-    kind = _classify_node(path)
-    if kind in ("regular", "directory"):
-        return f"{label}: {kind} ({path})"
-    return f"{label}: {kind} ({path})"
-
-
 # ─── Manifest validation and loading ─────────────────────────────────────────
 _TRANSACTION_ID_RE = re.compile(r"[0-9a-f]{32}")
 _NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _is_plain_basename(name: Any) -> bool:
+    return (
+        isinstance(name, str)
+        and name not in ("", ".", "..")
+        and not any(sep in name for sep in ("/", "\\", "\0"))
+    )
 
 
 def normalize_name(name: str) -> str:
@@ -773,7 +745,7 @@ def _validate_manifest(data: Any) -> Dict[str, Any]:
     if (system["before"] is None) != (system["backup"] is None):
         raise IntegrityConflict("manifest.system: before and backup must agree in nullness")
     if system["backup"] is not None:
-        if not isinstance(system["backup"], str) or not system["backup"].startswith(f"{SYSTEM_FILENAME}.bak_"):
+        if not _is_plain_basename(system["backup"]) or not system["backup"].startswith(f"{SYSTEM_FILENAME}.bak_"):
             raise IntegrityConflict(f"manifest.system: backup must start with {SYSTEM_FILENAME}.bak_")
 
     for block_key, block_label in (("append_system", "manifest.append_system"), ("agents_md", "manifest.agents_md")):
@@ -787,7 +759,7 @@ def _validate_manifest(data: Any) -> Dict[str, Any]:
     prev = _require_manifest_object(data["previous_manifest"], {"before", "backup"}, "manifest.previous_manifest")
     prev["before"] = _validate_portable_fingerprint(prev["before"], "manifest.previous_manifest.before")
     if prev["backup"] is not None:
-        if not isinstance(prev["backup"], str) or not prev["backup"].startswith(f"{MANIFEST_FILENAME}.bak_"):
+        if not _is_plain_basename(prev["backup"]) or not prev["backup"].startswith(f"{MANIFEST_FILENAME}.bak_"):
             raise IntegrityConflict(f"manifest.previous_manifest: backup must start with {MANIFEST_FILENAME}.bak_")
     if (prev["before"] is None) != (prev["backup"] is None):
         raise IntegrityConflict("manifest.previous_manifest: before and backup must agree in nullness")
@@ -814,38 +786,6 @@ def _utc_now() -> str:
 
 def _journal_dir(pi_dir: Path, transaction_id: str) -> Path:
     return pi_dir / f"{JOURNAL_PREFIX}{transaction_id}"
-
-
-def _journal_dirs(pi_dir: Path) -> List[Path]:
-    if not pi_dir.is_dir():
-        return []
-    result: List[Path] = []
-    for entry in sorted(os.listdir(str(pi_dir))):
-        if entry.startswith(JOURNAL_PREFIX):
-            p = pi_dir / entry
-            if p.is_dir() and not p.is_symlink():
-                result.append(p)
-    return result
-
-
-def _cleanup_claim_dirs(pi_dir: Path) -> List[Path]:
-    if not pi_dir.is_dir():
-        return []
-    result: List[Path] = []
-    for entry in sorted(os.listdir(str(pi_dir))):
-        if entry.startswith(CLEANUP_MARKER_PREFIX) and entry.endswith(CLEANUP_MARKER_SUFFIX):
-            result.append(pi_dir / entry)
-    return result
-
-
-def _keysmith_temp_dirs(pi_dir: Path) -> List[Path]:
-    if not pi_dir.is_dir():
-        return []
-    result: List[Path] = []
-    for entry in sorted(os.listdir(str(pi_dir))):
-        if entry.startswith(RESIDUE_TEMP_PREFIX):
-            result.append(pi_dir / entry)
-    return result
 
 
 def _residue_authorization_digest(transaction_id: str, directory: str, residue: Dict[str, Any]) -> str:
@@ -905,19 +845,6 @@ def _publish_journal_pending(journal_dir: Path, journal: Dict[str, Any]) -> None
     if _is_regular_path(pending_path):
         os.unlink(str(pending_path))
     _FILESYSTEM.write_private_text(pending_path, json.dumps(persisted, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-
-
-def _reconcile_pending(journal_dir: Path) -> None:
-    pending = journal_dir / JOURNAL_PENDING_FILENAME
-    journal = journal_dir / JOURNAL_FILENAME
-    if pending.exists() and _is_regular_path(pending):
-        if not journal.exists() or not _is_regular_path(journal):
-            data, _ = _read_regular_bytes_with_fingerprint(pending)
-            _FILESYSTEM.atomic_write_text(journal, data.decode("utf-8"))
-        try:
-            os.unlink(str(pending))
-        except OSError:
-            pass
 
 
 def _load_journal_file(path: Path) -> Dict[str, Any]:
@@ -1134,7 +1061,7 @@ def _create_uninstall_journals(
                 SYSTEM_FILENAME,
                 sys_before_fp,
                 sys_snapshot,
-                allowed_absent=False,
+                allowed_absent=system_after_fp is None,
                 allowed_sha256=[],
                 allowed_portable=[system_after_fp] if system_after_fp is not None else [],
             ),
@@ -1249,14 +1176,6 @@ def _build_deployment_manifest(
     return _validate_manifest(manifest)
 
 
-def _publish_deployment_manifest(pi_dir: Path, manifest: Dict[str, Any], expected_before: Optional[Dict[str, Any]]) -> str:
-    """Publish manifest atomically; return its SHA-256."""
-    path = pi_dir / MANIFEST_FILENAME
-    content = _serialize_manifest(manifest)
-    _FILESYSTEM.atomic_write_text(path, content, expected_fingerprint=expected_before)
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
-
-
 def _manifest_backup_name(timestamp: str) -> str:
     return f"{MANIFEST_FILENAME}.bak_{timestamp}"
 
@@ -1267,20 +1186,6 @@ def _system_backup_name(timestamp: str) -> str:
 
 def _manifest_archive_name(timestamp: str) -> str:
     return f"{MANIFEST_FILENAME}.uninstalled_{timestamp}"
-
-
-def _unique_archive_path(pi_dir: Path, base_name: str) -> Path:
-    """Return a non-colliding archive path under `pi_dir`, suffixing if needed."""
-    candidate = pi_dir / base_name
-    if not candidate.exists():
-        return candidate
-    stem, _, suffix = base_name.partition(".uninstalled_")
-    i = 1
-    while True:
-        alt = pi_dir / f"{stem}.uninstalled_{suffix}_{i}"
-        if not alt.exists():
-            return alt
-        i += 1
 
 
 # ─── Cleanup markers (re-enterable terminal cleanup) ─────────────────────────
@@ -1316,146 +1221,57 @@ def _remove_cleanup_intent(pi_dir: Path, transaction_id: str) -> None:
         _fsync_directory(pi_dir)
 
 
-# ─── Deployment ──────────────────────────────────────────────────────────────
-def load_md_content(file_path: Optional[str]) -> str:
-    if not file_path:
-        return BUILTIN_SYSTEM_PROMPT_MD
-    path = Path(file_path)
-    if not _is_regular_path(path):
-        raise IntegrityConflict(f"{file_path}: external prompt must be a regular file (no symlinks)")
-    data, _ = _read_regular_bytes_with_fingerprint(path)
-    return data.decode("utf-8")
-
-
-def _prompt_sha256(content: str) -> str:
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
-
-
-def _deploy_locked(args, pi_dirs: Optional[List[Path]] = None) -> None:
-    if pi_dirs is None:
-        dirs = find_pi_dirs()
-        if not dirs:
-            _print(_tr("no_pi_dirs"))
-            sys.exit(1)
-        pi_dirs = [Path(d) for d in dirs]
-    md_content = load_md_content(args.file)
-    prompt_sha = _prompt_sha256(md_content)
-    if args.file is None:
-        _print(_tr("prompt_source_builtin").format(sha=prompt_sha))
-    else:
-        _print(_tr("prompt_source_external").format(path=args.file, sha=prompt_sha))
-    _print(_tr("behavior_notice_title").format(name=TOOL_NAME))
-    _print(_tr("behavior_notice_preserve"))
-    if not args.yes:
-        _print(_tr("preview_only"))
-        _print_windows_fresh_deployment_beta_warning()
-        return
-    _print_windows_fresh_deployment_beta_warning()
-    transaction_id = _new_transaction_id()
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    # Preflight: classify nodes.
-    system_before: Dict[str, Optional[Dict[str, Any]]] = {}
-    manifest_before: Dict[str, Optional[Dict[str, Any]]] = {}
-    for pi_dir in pi_dirs:
-        resolved = str(pi_dir.resolve())
-        sys_path = pi_dir / SYSTEM_FILENAME
-        man_path = pi_dir / MANIFEST_FILENAME
-        for p in (sys_path, man_path, pi_dir / APPEND_SYSTEM_FILENAME, pi_dir / AGENTS_FILENAME, pi_dir / CLAUDE_FILENAME):
-            if p.is_symlink() or (p.exists() and not _is_regular_path(p)):
-                raise IntegrityConflict(f"{p}: managed target must be a regular file; refuse to proceed")
-        system_before[resolved] = _portable_fingerprint(sys_path)
-        manifest_before[resolved] = _portable_fingerprint(man_path)
-    journals = _create_deployment_journals(pi_dirs, transaction_id, system_before, manifest_before, prompt_sha)
-    _update_journals(journals, PHASE_PREPARED)
-    system_backup_names: Dict[str, Optional[str]] = {}
-    prev_manifest_backup: Dict[str, Optional[str]] = {}
+def _valid_cleanup_intent(intent: Any, transaction_id: str) -> bool:
+    if not isinstance(intent, dict):
+        return False
+    if set(intent.keys()) != {"transaction_id", "terminal_phase", "journal_dir", "members"}:
+        return False
+    if intent["transaction_id"] != transaction_id or intent["journal_dir"] != f"{JOURNAL_PREFIX}{transaction_id}":
+        return False
+    if intent["terminal_phase"] not in (PHASE_COMMITTED, PHASE_RECOVERED):
+        return False
+    if not isinstance(intent["members"], dict):
+        return False
     try:
-        # system-intent phase: write SYSTEM.md (backup existing first).
-        for pi_dir in pi_dirs:
-            resolved = str(pi_dir.resolve())
-            sys_path = pi_dir / SYSTEM_FILENAME
-            before_fp = system_before[resolved]
-            if before_fp is not None:
-                backup_name = _system_backup_name(timestamp)
-                backup_path = pi_dir / backup_name
-                _FILESYSTEM.copy_to_backup(sys_path, backup_path)
-                system_backup_names[resolved] = backup_name
-            else:
-                system_backup_names[resolved] = None
-        _update_journals(journals, PHASE_SYSTEM_INTENT)
-        for pi_dir in pi_dirs:
-            resolved = str(pi_dir.resolve())
-            sys_path = pi_dir / SYSTEM_FILENAME
-            before_fp = system_before[resolved]
-            _FILESYSTEM.atomic_write_text(sys_path, md_content, expected_fingerprint=before_fp)
-        # manifest-intent phase: backup previous manifest, publish new.
-        for pi_dir in pi_dirs:
-            resolved = str(pi_dir.resolve())
-            man_path = pi_dir / MANIFEST_FILENAME
-            before_fp = manifest_before[resolved]
-            if before_fp is not None:
-                backup_name = _manifest_backup_name(timestamp)
-                backup_path = pi_dir / backup_name
-                _FILESYSTEM.copy_to_backup(man_path, backup_path)
-                prev_manifest_backup[resolved] = backup_name
-            else:
-                prev_manifest_backup[resolved] = None
-        # Build manifests per dir.
-        manifests: Dict[str, Dict[str, Any]] = {}
-        manifest_shas: Dict[str, str] = {}
-        for pi_dir in pi_dirs:
-            resolved = str(pi_dir.resolve())
-            sys_path = pi_dir / SYSTEM_FILENAME
-            append_path = pi_dir / APPEND_SYSTEM_FILENAME
-            agents_path = pi_dir / AGENTS_FILENAME
-            sys_after_fp = _portable_fingerprint(sys_path)
-            manifests[resolved] = _build_deployment_manifest(
-                transaction_id=transaction_id,
-                system_before=system_before[resolved],
-                system_after=sys_after_fp,
-                system_backup=system_backup_names[resolved],
-                append_system_path=APPEND_SYSTEM_FILENAME,
-                append_system_preserved=append_path.exists() and _is_regular_path(append_path),
-                append_system_fp=_portable_fingerprint(append_path),
-                agents_md_path=AGENTS_FILENAME,
-                agents_md_preserved=agents_path.exists() and _is_regular_path(agents_path),
-                agents_md_fp=_portable_fingerprint(agents_path),
-                previous_manifest_before=manifest_before[resolved],
-                previous_manifest_backup=prev_manifest_backup[resolved],
-            )
-            manifest_shas[resolved] = _publish_deployment_manifest(pi_dir, manifests[resolved], manifest_before[resolved])
-        _update_journals(journals, PHASE_MANIFEST_INTENT, manifest_sha256=manifest_shas)
-        # final-sweep: re-fingerprint system + manifest match expectations.
-        for pi_dir in pi_dirs:
-            resolved = str(pi_dir.resolve())
-            sys_path = pi_dir / SYSTEM_FILENAME
-            man_path = pi_dir / MANIFEST_FILENAME
-            if not _path_has_fingerprint(sys_path, manifests[resolved]["system"]["after"]):
-                raise IntegrityConflict(f"{sys_path}: post-deploy fingerprint drift")
-            live_manifest = _portable_fingerprint(man_path)
-            if live_manifest is None or live_manifest["sha256"] != manifest_shas[resolved]:
-                raise IntegrityConflict(f"{man_path}: post-deploy manifest sha drift")
-        _update_journals(journals, PHASE_FINAL_SWEEP)
-        _update_journals(journals, PHASE_COMMITTED)
-        # Terminal cleanup: publish cleanup intent, remove journal, remove marker.
-        for pi_dir in pi_dirs:
-            resolved = str(pi_dir.resolve())
-            jdir = _journal_dir(pi_dir, transaction_id)
-            members = _enumerate_journal_members(jdir)
-            _publish_cleanup_intent(pi_dir, transaction_id, members, PHASE_COMMITTED)
-            _safe_remove_journal(pi_dir, transaction_id, members)
-            _remove_cleanup_intent(pi_dir, transaction_id)
-        for pi_dir in pi_dirs:
-            _print(_tr("deployed").format(path=pi_dir / SYSTEM_FILENAME))
-    except BaseException:
-        # On any failure after journal creation, leave the durable journal in place
-        # for explicit --recover; do NOT auto-rollback (SIGKILL cannot run Python).
-        raise
+        for name, fp in intent["members"].items():
+            if not _is_plain_basename(name):
+                return False
+            _validate_portable_fingerprint(fp, f"cleanup.members[{name}]")
+    except IntegrityConflict:
+        return False
+    return True
 
 
-def _safe_remove_journal(pi_dir: Path, transaction_id: str, members: Dict[str, Optional[Dict[str, Any]]]) -> None:
-    jdir = _journal_dir(pi_dir, transaction_id)
-    _FILESYSTEM.safe_remove_owned_directory(jdir, members)
+def _journal_members_match(journal_dir: Path, members: Dict[str, Optional[Dict[str, Any]]]) -> bool:
+    """True when every remaining member of `journal_dir` is a recorded, unchanged regular file."""
+    try:
+        entries = os.listdir(str(journal_dir))
+    except OSError:
+        return False
+    for entry in entries:
+        if entry not in members or not _path_has_fingerprint(journal_dir / entry, members[entry]):
+            return False
+    return True
+
+
+def _remove_journal_dir(journal_dir: Path, members: Dict[str, Optional[Dict[str, Any]]]) -> None:
+    """Remove a private journal directory after verifying its remaining members."""
+    if not _journal_members_match(journal_dir, members):
+        raise IntegrityConflict(f"{journal_dir.name}: journal members changed; refuse to clean")
+    for entry in sorted(os.listdir(str(journal_dir))):
+        os.unlink(str(journal_dir / entry))
+    os.rmdir(str(journal_dir))
+    _fsync_directory(journal_dir.parent)
+
+
+def _cleanup_journal(root: Path, transaction_id: str, terminal_phase: str) -> str:
+    """Re-enterable terminal cleanup: marker -> journal removal -> marker removal."""
+    journal_dir = _journal_dir(root, transaction_id)
+    members = _enumerate_journal_members(journal_dir)
+    _publish_cleanup_intent(root, transaction_id, members, terminal_phase)
+    _remove_journal_dir(journal_dir, members)
+    _remove_cleanup_intent(root, transaction_id)
+    return journal_dir.name
 
 
 def _enumerate_journal_members(jdir: Path) -> Dict[str, Optional[Dict[str, Any]]]:
@@ -1473,302 +1289,907 @@ def _enumerate_journal_members(jdir: Path) -> Dict[str, Optional[Dict[str, Any]]
     return members
 
 
-# ─── Status ───────────────────────────────────────────────────────────────────
-def show_status(pi_dirs: List[str], lang_preview: bool = False) -> None:
-    if not pi_dirs:
-        _print(_tr("no_pi_dirs"))
-        sys.exit(1)
-    _print(_tr("found_dirs").format(n=len(pi_dirs)))
-    any_blocker = False
-    for raw in pi_dirs:
-        pi_dir = Path(raw)
-        _print(_tr("status_dir").format(dir=pi_dir))
-        _print(f"    {_node_desc('SYSTEM.md', pi_dir / SYSTEM_FILENAME)}")
-        _print(f"    {_node_desc('APPEND_SYSTEM.md', pi_dir / APPEND_SYSTEM_FILENAME)}")
-        _print(f"    {_node_desc('AGENTS.md', pi_dir / AGENTS_FILENAME)}")
-        _print(f"    {_node_desc('CLAUDE.md', pi_dir / CLAUDE_FILENAME)}")
-        man_path = pi_dir / MANIFEST_FILENAME
-        _print(f"    {_node_desc(_tr('deploy_manifest'), man_path)}")
-        # Manifest detail.
-        manifest_valid = False
-        if _is_regular_path(man_path):
-            try:
-                manifest, _ = _load_manifest(man_path)
-                _print(f"        deployment_id: {manifest['deployment_id']}")
-                _print(f"        system.after.sha256: {manifest['system']['after']['sha256']}")
-                _print(f"        append_system.preserved: {manifest['append_system']['preserved']}")
-                _print(f"        agents_md.preserved: {manifest['agents_md']['preserved']}")
-                manifest_valid = True
-            except IntegrityConflict as exc:
-                _print(f"        [invalid manifest] {exc}")
-                any_blocker = True
-        # Transaction residue.
-        jdirs = _journal_dirs(pi_dir)
-        cleanup = _cleanup_claim_dirs(pi_dir)
-        temps = _keysmith_temp_dirs(pi_dir)
-        residue_parts: List[str] = []
-        if jdirs:
-            residue_parts.append(f"{len(jdirs)} journal dir(s)")
-        if cleanup:
-            residue_parts.append(f"{len(cleanup)} cleanup marker(s)")
-        if temps:
-            residue_parts.append(f"{len(temps)} temp dir(s)")
-        residue_str = ", ".join(residue_parts) if residue_parts else _tr("none_word")
-        _print(f"    {_tr('transaction_residue')}: {residue_str}")
-        if jdirs or cleanup or temps:
-            any_blocker = True
-        # Readiness.
-        structural = _tr("healthy") if manifest_valid or not _is_regular_path(man_path) else _tr("blocked")
-        uninstall_ready = _tr("ready") if manifest_valid and not (jdirs or cleanup or temps) else _tr("blocked")
-        deploy_ready = _tr("ready") if not (jdirs or cleanup or temps) else _tr("blocked")
-        _print(f"    {_tr('structural_health')}: {structural}")
-        _print(f"    {_tr('uninstall_readiness')}: {uninstall_ready}")
-        _print(f"    {_tr('deployability')}: {deploy_ready}")
-    if any_blocker:
-        sys.exit(1)
+def _unique_path(root: Path, base_name: str) -> Path:
+    """Return a non-colliding sibling path under `root`, suffixing `_<n>` if needed."""
+    candidate = root / base_name
+    counter = 1
+    while os.path.lexists(str(candidate)):
+        candidate = root / f"{base_name}_{counter}"
+        counter += 1
+    return candidate
 
 
-# ─── Recovery ─────────────────────────────────────────────────────────────────
-def _journal_operation(journal_dir: Path) -> str:
-    data = _load_journal(journal_dir)
-    return data["operation"]
+def _timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
 
-def _recover_deployment_locked(pi_dirs: List[str], yes: bool) -> None:
-    # Collect journals across selected dirs.
-    journal_map: Dict[str, List[Path]] = {}
-    for raw in pi_dirs:
-        pi_dir = Path(raw)
-        for jd in _journal_dirs(pi_dir):
-            try:
-                op = _journal_operation(jd)
-            except IntegrityConflict:
-                continue
-            journal_map.setdefault(op, []).append(jd)
-    if not journal_map:
-        _print(_localized("未找到需要恢复的事务 journal。", "No transaction journal requiring recovery found."))
-        return
-    if OPERATION_DEPLOY in journal_map and OPERATION_UNINSTALL in journal_map:
-        raise IntegrityConflict("同一恢复范围包含 deploy 与 uninstall 事务；请分别指定其参与目录恢复。")
-    operations = set(journal_map.keys())
-    if operations == {OPERATION_UNINSTALL}:
-        _recover_uninstall(journal_map[OPERATION_UNINSTALL], yes)
-        return
-    # Deploy recovery.
-    journals = journal_map[OPERATION_DEPLOY]
-    # Validate a single transaction id and gather participants.
-    tid_set = set()
-    ref_journal: Optional[Dict[str, Any]] = None
-    for jd in journals:
-        data = _load_journal(jd)
-        tid_set.add(data["transaction_id"])
-        if ref_journal is None:
-            ref_journal = data
-    if len(tid_set) != 1:
-        raise IntegrityConflict(f"多个 transaction ID 被发现: {sorted(tid_set)}；请分别恢复。")
-    tid = tid_set.pop()
-    assert ref_journal is not None
-    participants = ref_journal["participants"]
-    # Build per-participant journal lookup.
-    by_participant: Dict[str, Dict[str, Any]] = {}
-    for jd in journals:
-        data = _load_journal(jd)
-        owner = data["owner_directory"]
-        by_participant[owner] = data
-    # Preflight: each participant journal must exist and live resources match before/after/residue.
-    blockers: List[str] = []
-    for p in participants:
-        if p not in by_participant:
-            blockers.append(f"{p}: 缺少该参与目录的 journal")
-            continue
-        jdata = by_participant[p]
-        pi_dir = Path(p)
-        for label, res in jdata["directories"][p]["resources"].items():
-            rpath = pi_dir / res["path"]
-            live_fp = _portable_fingerprint(rpath)
-            ok = False
-            if live_fp is not None and live_fp["sha256"] in res["allowed_sha256"]:
-                ok = True
-            if _path_has_fingerprint(rpath, res["before"]):
-                ok = True
-            for ap in res["allowed_portable"]:
-                if ap is not None and _path_has_fingerprint(rpath, ap):
-                    ok = True
-            if res["allowed_absent"] and live_fp is None:
-                ok = True
-            if not ok:
-                blockers.append(f"{p}: {label} 当前状态既非 before 也非计划 after")
-    if blockers:
-        for b in blockers:
-            _print(f"[blocker] {b}")
-        raise IntegrityConflict("恢复预检失败；保留 journal/快照/证据供人工核对。")
-    if not yes:
-        _print(_tr("recover_preview_only"))
-        _print(_localized(f"将按反向顺序恢复事务 {tid}（manifest → system）。", f"Would reverse-restore transaction {tid} (manifest -> system)."))
-        return
-    # Set recovering phase.
-    journals_to_update: Dict[str, Dict[str, Any]] = {}
-    for p in participants:
-        journals_to_update[p] = by_participant[p]
-    _update_journals(journals_to_update, PHASE_RECOVERING)
-    # Reverse rollback: manifest first, then system.
-    for p in reversed(participants):
-        pi_dir = Path(p)
-        jdata = by_participant[p]
-        resources = jdata["directories"][p]["resources"]
-        for label in (RESOURCE_MANIFEST, RESOURCE_SYSTEM):
-            res = resources[label]
-            rpath = pi_dir / res["path"]
-            if _path_has_fingerprint(rpath, res["before"]):
-                continue
-            if res["before"] is None:
-                # Remove the created file.
-                if rpath.exists():
-                    os.unlink(str(rpath))
-                    _fsync_directory(pi_dir)
+# ─── Prompt ──────────────────────────────────────────────────────────────────
+def load_md_content(file_path: Optional[str]) -> str:
+    if not file_path:
+        return BUILTIN_SYSTEM_PROMPT_MD
+    path = Path(file_path)
+    if not _is_regular_path(path):
+        raise IntegrityConflict(f"{file_path}: external prompt must be a regular file (no symlinks)")
+    data, _ = _read_regular_bytes_with_fingerprint(path)
+    return data.decode("utf-8")
+
+
+def _prompt_sha256(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+# ─── Contract diagnostics ────────────────────────────────────────────────────
+class UsageError(Exception):
+    def __init__(self, code: str, detail: Optional[str] = None):
+        super().__init__(code if detail is None else f"{code}: {detail}")
+        self.code = code
+        self.detail = detail
+
+
+class ContractExit(Exception):
+    """Stop an operation with a fixed exit code and diagnostic codes."""
+
+    def __init__(self, exit_code: int, codes: List[str], detail: Optional[str] = None):
+        super().__init__(", ".join(codes))
+        self.exit_code = exit_code
+        self.codes = codes
+        self.detail = detail
+
+
+_DIAGNOSTICS: Dict[str, Tuple[str, str]] = {
+    "pi-dir-missing": ("pi 目录不存在；pi-keysmith 不会创建它", "pi directory does not exist; pi-keysmith never creates it"),
+    "pi-dir-not-directory": ("pi 目录路径不是目录", "pi directory path is not a directory"),
+    "system-not-regular": ("SYSTEM.md 不是普通文件", "SYSTEM.md is not a regular file"),
+    "manifest-not-regular": ("manifest 不是普通文件", "manifest is not a regular file"),
+    "manifest-invalid": ("manifest 校验失败", "manifest failed validation"),
+    "journal-invalid": ("事务 journal 或清理标记无法解析", "transaction journal or cleanup marker cannot be parsed"),
+    "journal-ambiguous": ("存在多个未完成事务；需人工处理", "multiple unfinished transactions; manual review required"),
+    "residue-not-regular": ("残留临时文件不是普通文件", "residue temp entry is not a regular file"),
+    "recover-resource-unexpected": ("资源当前状态既非 before 也非计划 after", "resource is neither its before state nor a planned after state"),
+    "residue-present": ("存在事务残留；请先 --recover", "transaction residue present; run --recover first"),
+    "preserved-not-regular": ("受保护文件不是普通文件；拒绝部署", "preserved file is not a regular file; deploy refused"),
+    "not-installed": ("没有有效的 pi-keysmith 部署", "no valid pi-keysmith deployment"),
+    "system-fingerprint-mismatch": ("SYSTEM.md 与 manifest 记录的部署内容不一致", "SYSTEM.md differs from the deployed content recorded in the manifest"),
+    "system-backup-missing": ("SYSTEM.md 备份缺失", "SYSTEM.md backup is missing"),
+    "system-backup-mismatch": ("SYSTEM.md 备份指纹不符", "SYSTEM.md backup fingerprint mismatch"),
+    "manifest-backup-missing": ("上一层 manifest 备份缺失", "previous manifest backup is missing"),
+    "manifest-backup-mismatch": ("上一层 manifest 备份指纹不符", "previous manifest backup fingerprint mismatch"),
+    "preserved-changed": ("该文件自部署后已变化；卸载不会改写它", "file changed since deploy; uninstall will not touch it"),
+    "preview-token-mismatch": ("状态已在预览后变化；请重新预览", "state changed since preview; preview again"),
+    "preview-token-required": ("确认写需要 --expected-preview-token", "confirmed writes require --expected-preview-token"),
+    "preview-token-invalid": ("预览 token 必须是 64 位小写 hex", "preview token must be 64 lowercase hex characters"),
+    "preview-token-unexpected": ("--expected-preview-token 只用于确认写", "--expected-preview-token is only valid for confirmed writes"),
+    "pi-dir-required": ("--json 需要 --pi-dir", "--json requires --pi-dir"),
+    "pi-dir-not-absolute": ("--pi-dir 必须是绝对路径", "--pi-dir must be an absolute path"),
+    "name-invalid": ("--name 只能包含字母、数字、点、下划线和连字符", "--name may only contain letters, digits, dot, underscore, and hyphen"),
+    "prompt-file-invalid": ("--file 必须是 UTF-8 普通文件", "--file must be a UTF-8 regular file"),
+    "usage-error": ("参数错误", "usage error"),
+    "lock-busy": ("另一个 pi-keysmith 进程持有目录锁", "another pi-keysmith process holds the directory lock"),
+    "lock-unavailable": ("无法打开目录锁文件", "cannot open the directory lock file"),
+    "write-failed": ("写入开始后失败；可能需要 --recover", "failed after writes began; --recover may be required"),
+    "windows-beta": (
+        "Windows 上的 pi-keysmith 部署为 EXPLICIT_BETA，不构成正式支持",
+        "pi-keysmith deployment on Windows is EXPLICIT_BETA and is not a formal support claim",
+    ),
+}
+
+
+def _diagnostic(code: str, detail: Optional[str] = None) -> str:
+    base, _, qualifier = code.partition(":")
+    zh_cn, english = _DIAGNOSTICS.get(base, (base, base))
+    text = _localized(zh_cn, english)
+    extras = [x for x in (qualifier, detail) if x]
+    if extras:
+        text = f"{text} ({'; '.join(extras)})"
+    return f"{base}: {text}"
+
+
+# ─── Inspection ──────────────────────────────────────────────────────────────
+def _add_code(codes: List[str], code: str) -> None:
+    if code not in codes:
+        codes.append(code)
+
+
+def _short_fingerprint(path: Path) -> Optional[Dict[str, Any]]:
+    fp = _fingerprint_or_none(path)
+    return None if fp is None else {"sha256": fp["sha256"], "size": fp["size"]}
+
+
+def _file_sha256(path: Path) -> Optional[str]:
+    fp = _fingerprint_or_none(path)
+    return None if fp is None else fp["sha256"]
+
+
+def _node(path: Path) -> Dict[str, Any]:
+    kind = _classify_node(path)
+    return {"kind": kind, "path": str(path), "fingerprint": _short_fingerprint(path) if kind == "regular" else None}
+
+
+def _pi_dir_kind(path: Path) -> str:
+    if os.path.isdir(str(path)):
+        return "directory"
+    if not os.path.lexists(str(path)):
+        return "missing"
+    return _classify_node(path)
+
+
+def _public_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "deployment_id": manifest["deployment_id"],
+        "tool_version": manifest["tool_version"],
+        "system": {
+            "before": manifest["system"]["before"],
+            "after": manifest["system"]["after"],
+            "backup": manifest["system"]["backup"],
+        },
+        "append_system": {"preserved": manifest["append_system"]["preserved"]},
+        "agents_md": {"preserved": manifest["agents_md"]["preserved"]},
+        "previous_manifest": {
+            "before": manifest["previous_manifest"]["before"],
+            "backup": manifest["previous_manifest"]["backup"],
+        },
+    }
+
+
+def _scan_residue(root: Path, conflicts: List[str]) -> Dict[str, Any]:
+    """Classify journals, cleanup markers, and temp files under `root`."""
+    journal_dirs: List[Path] = []
+    markers: Dict[str, Tuple[Path, Dict[str, Any]]] = {}
+    temps: List[Path] = []
+    for entry in sorted(os.listdir(str(root))):
+        path = root / entry
+        if entry.startswith(JOURNAL_PREFIX):
+            if os.path.islink(str(path)) or not path.is_dir():
+                _add_code(conflicts, "journal-invalid")
             else:
-                snapshot_path = _journal_dir(pi_dir, tid) / res["snapshot"]
-                _FILESYSTEM.replace_owned_from_backup(snapshot_path, rpath, res["before"])
-            # Verify.
-            if not _path_has_fingerprint(rpath, res["before"]):
-                raise IntegrityConflict(f"{rpath}: 恢复后指纹不匹配 before")
-    _update_journals(journals_to_update, PHASE_RECOVERED)
-    # Cleanup.
-    for p in participants:
-        pi_dir = Path(p)
-        jdir = _journal_dir(pi_dir, tid)
-        members = _enumerate_journal_members(jdir)
-        _publish_cleanup_intent(pi_dir, tid, members, PHASE_RECOVERED)
-        _safe_remove_journal(pi_dir, tid, members)
-        _remove_cleanup_intent(pi_dir, tid)
-    _print(_tr("recovered").format(tid=tid))
+                journal_dirs.append(path)
+        elif entry.startswith(CLEANUP_MARKER_PREFIX) and entry.endswith(CLEANUP_MARKER_SUFFIX):
+            tid = entry[len(CLEANUP_MARKER_PREFIX):-len(CLEANUP_MARKER_SUFFIX)]
+            if not _is_regular_path(path):
+                _add_code(conflicts, "residue-not-regular")
+                continue
+            try:
+                intent = _load_cleanup_intent(root, tid) if _TRANSACTION_ID_RE.fullmatch(tid) else None
+            except (IntegrityConflict, OSError):
+                intent = None
+            if intent is None or not _valid_cleanup_intent(intent, tid):
+                _add_code(conflicts, "journal-invalid")
+                continue
+            markers[tid] = (path, intent)
+        elif entry.startswith(RESIDUE_TEMP_PREFIX):
+            if _is_regular_path(path):
+                temps.append(path)
+            else:
+                _add_code(conflicts, "residue-not-regular")
+
+    live: List[Dict[str, Any]] = []
+    cleaning: List[Dict[str, Any]] = []
+    for jdir in journal_dirs:
+        tid = jdir.name[len(JOURNAL_PREFIX):]
+        journal_file = jdir / JOURNAL_FILENAME
+        if not _is_regular_path(journal_file):
+            journal_file = jdir / JOURNAL_PENDING_FILENAME
+        if tid in markers:
+            # Terminal cleanup was interrupted: finish it, never parse or roll back.
+            marker, intent = markers[tid]
+            if not _journal_members_match(jdir, intent["members"]):
+                _add_code(conflicts, "journal-invalid")
+                continue
+            cleaning.append({
+                "dir": jdir,
+                "transaction_id": tid,
+                "marker": marker,
+                "members": intent["members"],
+                "phase": intent["terminal_phase"],
+                "sha256": _file_sha256(journal_file),
+            })
+            continue
+        try:
+            data = _load_journal(jdir)
+            resources = data["directories"][str(root)]["resources"]
+            if (
+                data["transaction_id"] != tid
+                or data["participants"] != [str(root)]
+                or set(resources.keys()) != {RESOURCE_SYSTEM, RESOURCE_MANIFEST}
+                or resources[RESOURCE_SYSTEM]["path"] != SYSTEM_FILENAME
+                or resources[RESOURCE_MANIFEST]["path"] != MANIFEST_FILENAME
+            ):
+                raise IntegrityConflict("journal: unexpected shape")
+        except Exception:
+            _add_code(conflicts, "journal-invalid")
+            continue
+        live.append({
+            "dir": jdir,
+            "data": data,
+            "phase": data["phase"],
+            "terminal": data["phase"] in (PHASE_COMMITTED, PHASE_RECOVERED),
+            "sha256": _file_sha256(journal_file),
+            "actions": [],
+        })
+    if len(live) > 1:
+        _add_code(conflicts, "journal-ambiguous")
+    for journal in live:
+        if not journal["terminal"]:
+            journal["actions"] = _recovery_actions(root, journal, conflicts)
+    paired = {c["transaction_id"] for c in cleaning}
+    return {
+        "live": live,
+        "cleaning": cleaning,
+        "orphan_markers": [m[0] for tid, m in sorted(markers.items()) if tid not in paired],
+        "markers": [m[0] for _, m in sorted(markers.items())],
+        "temp_files": temps,
+    }
 
 
-def _recover_uninstall(journals: List[Path], yes: bool) -> None:
-    # For an interrupted uninstall, the forward operation was removing the managed
-    # layer; recovery restores the before-state captured in snapshots (manifest +
-    # system). This mirrors deploy recovery because the captured before-state is
-    # the pre-uninstall state we want back.
-    _recover_deployment_locked([str(jd.parent) for jd in journals], yes)
+def _recovery_actions(root: Path, journal: Dict[str, Any], conflicts: List[str]) -> List[Tuple[str, str]]:
+    """Reverse actions for an unfinished journal; unexpected live state becomes a conflict."""
+    resources = journal["data"]["directories"][str(root)]["resources"]
+    actions: List[Tuple[str, str]] = []
+    for label in (RESOURCE_MANIFEST, RESOURCE_SYSTEM):
+        res = resources[label]
+        rpath = root / res["path"]
+        if _path_has_fingerprint(rpath, res["before"]):
+            continue
+        kind = _classify_node(rpath)
+        live_fp = _portable_fingerprint(rpath) if kind == "regular" else None
+        allowed = kind in ("missing", "regular") and (
+            (live_fp is not None and live_fp["sha256"] in res["allowed_sha256"])
+            or any(ap is not None and _path_has_fingerprint(rpath, ap) for ap in res["allowed_portable"])
+            or (res["allowed_absent"] and kind == "missing")
+        )
+        if not allowed:
+            _add_code(conflicts, f"recover-resource-unexpected:{label}")
+            continue
+        if res["before"] is None:
+            actions.append((label, "remove"))
+            continue
+        snapshot = res["snapshot"]
+        if not _is_plain_basename(snapshot) or not _path_has_fingerprint(journal["dir"] / snapshot, res["before"]):
+            _add_code(conflicts, "journal-invalid")
+            continue
+        actions.append((label, "restore"))
+    return actions
 
 
-def recover_deployment(pi_dirs: List[str], yes: bool) -> None:
-    if not pi_dirs:
-        _print(_tr("no_pi_dirs"))
-        sys.exit(1)
-    _recover_deployment_locked(pi_dirs, yes)
+def _inspect(pi_dir: Path) -> Dict[str, Any]:
+    """Read-only snapshot shared by status, plans, and the locked confirm path."""
+    root = Path(os.path.realpath(str(pi_dir)))
+    pi_kind = _pi_dir_kind(pi_dir)
+    is_dir = pi_kind == "directory"
+    nodes: Dict[str, Any] = {"pi_dir": {"kind": pi_kind, "path": str(pi_dir)}}
+    for key, filename in (
+        ("system", SYSTEM_FILENAME),
+        ("manifest", MANIFEST_FILENAME),
+        ("append_system", APPEND_SYSTEM_FILENAME),
+        ("agents_md", AGENTS_FILENAME),
+        ("claude_md", CLAUDE_FILENAME),
+    ):
+        nodes[key] = _node(pi_dir / filename) if is_dir else {"kind": "missing", "path": str(pi_dir / filename), "fingerprint": None}
+
+    conflicts: List[str] = []
+    drift: List[str] = []
+    preserved_changed: List[str] = []
+    manifest: Optional[Dict[str, Any]] = None
+    residue = {"live": [], "cleaning": [], "orphan_markers": [], "markers": [], "temp_files": []}
+    if pi_kind != "missing" and not is_dir:
+        conflicts.append("pi-dir-not-directory")
+    if is_dir:
+        if nodes["system"]["kind"] not in ("missing", "regular"):
+            conflicts.append("system-not-regular")
+        if nodes["manifest"]["kind"] not in ("missing", "regular"):
+            conflicts.append("manifest-not-regular")
+        elif nodes["manifest"]["kind"] == "regular":
+            try:
+                manifest, _ = _load_manifest(root / MANIFEST_FILENAME)
+            except Exception:
+                conflicts.append("manifest-invalid")
+        residue = _scan_residue(root, conflicts)
+        if manifest is not None:
+            if not _path_has_fingerprint(root / SYSTEM_FILENAME, manifest["system"]["after"]):
+                drift.append("system-fingerprint-mismatch")
+            for key, filename in (("append_system", APPEND_SYSTEM_FILENAME), ("agents_md", AGENTS_FILENAME)):
+                if not _path_has_fingerprint(root / filename, manifest[key]["fingerprint"]):
+                    preserved_changed.append(key)
+
+    residue_names = {
+        "journals": sorted(j["dir"].name for j in residue["live"] + residue["cleaning"]),
+        "cleanup_markers": sorted(m.name for m in residue["markers"]),
+        "temp_files": sorted(t.name for t in residue["temp_files"]),
+    }
+    has_residue = any(residue_names.values())
+
+    if pi_kind == "missing":
+        state = STATE_NOT_INSTALLED
+    elif conflicts:
+        state = STATE_CONFLICT
+    elif has_residue:
+        state = STATE_RECOVERY_REQUIRED
+    elif manifest is None:
+        state = STATE_NOT_INSTALLED
+    elif drift:
+        state = STATE_DRIFT
+    else:
+        state = STATE_ACTIVE_ALIGNED
+
+    deploy_blockers = list(conflicts)
+    uninstall_blockers = list(conflicts)
+    if pi_kind == "missing":
+        deploy_blockers.append("pi-dir-missing")
+        uninstall_blockers.append("pi-dir-missing")
+    if has_residue:
+        deploy_blockers.append("residue-present")
+    for key in ("append_system", "agents_md", "claude_md"):
+        if nodes[key]["kind"] not in ("missing", "regular"):
+            deploy_blockers.append(f"preserved-not-regular:{key}")
+    if manifest is None:
+        uninstall_blockers.append("not-installed")
+    if has_residue:
+        uninstall_blockers.append("residue-present")
+    if manifest is not None:
+        uninstall_blockers.extend(drift)
+        uninstall_blockers.extend(_backup_blockers(root, manifest))
+
+    status = {
+        "state": state,
+        "recovery_required": state == STATE_RECOVERY_REQUIRED,
+        "nodes": nodes,
+        "manifest": _public_manifest(manifest) if manifest is not None else None,
+        "drift": drift,
+        "conflicts": conflicts,
+        "residue": residue_names,
+        "preserved_changed": preserved_changed,
+        "blockers": {"deploy": deploy_blockers, "uninstall": uninstall_blockers},
+        "deployable": not deploy_blockers,
+        "uninstall_ready": not uninstall_blockers,
+    }
+    return {"pi_dir": pi_dir, "root": root, "is_dir": is_dir, "manifest": manifest, "residue": residue, "status": status}
 
 
-# ─── Uninstall ────────────────────────────────────────────────────────────────
-def _uninstall_locked(pi_dirs: List[str], yes: bool) -> None:
-    if not pi_dirs:
-        _print(_tr("no_pi_dirs"))
-        sys.exit(1)
-    pi_dir = Path(pi_dirs[0])
-    man_path = pi_dir / MANIFEST_FILENAME
-    if not _is_regular_path(man_path):
-        _print(_tr("no_manifest_noop"))
-        return
-    manifest, manifest_before_fp = _load_manifest(man_path)
-    sys_path = pi_dir / SYSTEM_FILENAME
-    # Verify current SYSTEM.md matches manifest system.after.
-    if not _path_has_fingerprint(sys_path, manifest["system"]["after"]):
-        raise IntegrityConflict(f"{sys_path}: 当前内容与 manifest 记录的 after 不一致；中止卸载。")
-    # Verify backup exists if before was non-null.
-    system_before = manifest["system"]["before"]
-    system_backup_name = manifest["system"]["backup"]
-    if system_before is not None:
-        if system_backup_name is None:
-            raise IntegrityConflict("manifest: system.before 非空但 backup 缺失")
-        backup_path = pi_dir / system_backup_name
-        if not _is_regular_path(backup_path):
-            raise IntegrityConflict(f"{backup_path}: system 备份缺失")
-        if not _path_has_fingerprint(backup_path, system_before):
-            raise IntegrityConflict(f"{backup_path}: system 备份内容与 before 不一致")
-    # Verify append_system / agents_md unchanged (we never touch them; just report drift).
-    append_path = pi_dir / APPEND_SYSTEM_FILENAME
-    agents_path = pi_dir / AGENTS_FILENAME
-    if manifest["append_system"]["preserved"] and not _path_has_fingerprint(append_path, manifest["append_system"]["fingerprint"]):
-        _print(_localized("[警告] APPEND_SYSTEM.md 自部署后已变化；卸载不会改写它。", "[Warning] APPEND_SYSTEM.md changed since deploy; uninstall will not touch it."))
-    if manifest["agents_md"]["preserved"] and not _path_has_fingerprint(agents_path, manifest["agents_md"]["fingerprint"]):
-        _print(_localized("[警告] AGENTS.md 自部署后已变化；卸载不会改写它。", "[Warning] AGENTS.md changed since deploy; uninstall will not touch it."))
-    # Verify previous manifest backup if present.
-    prev_before = manifest["previous_manifest"]["before"]
-    prev_backup_name = manifest["previous_manifest"]["backup"]
-    if prev_before is not None:
-        if prev_backup_name is None:
-            raise IntegrityConflict("manifest: previous_manifest.before 非空但 backup 缺失")
-        prev_backup_path = pi_dir / prev_backup_name
-        if not _is_regular_path(prev_backup_path):
-            raise IntegrityConflict(f"{prev_backup_path}: previous manifest 备份缺失")
-    if not yes:
-        _print(_tr("uninstall_preview_only"))
-        _print(_localized(
-            f"将恢复 SYSTEM.md 到部署前状态，归档当前 manifest，并{'恢复上一层 manifest' if prev_before is not None else '删除当前 manifest'}。",
-            f"Would restore SYSTEM.md to pre-deploy state, archive the current manifest, and {'restore the previous manifest layer' if prev_before is not None else 'remove the current manifest'}.",
-        ))
-        return
-    # Create durable journal for the uninstall.
+def _backup_blockers(root: Path, manifest: Dict[str, Any]) -> List[str]:
+    blockers: List[str] = []
+    for before, backup, prefix in (
+        (manifest["system"]["before"], manifest["system"]["backup"], "system"),
+        (manifest["previous_manifest"]["before"], manifest["previous_manifest"]["backup"], "manifest"),
+    ):
+        if before is None:
+            continue
+        path = root / backup
+        if not _is_regular_path(path):
+            blockers.append(f"{prefix}-backup-missing")
+        elif not _path_has_fingerprint(path, before):
+            blockers.append(f"{prefix}-backup-mismatch")
+    return blockers
+
+
+# ─── Plans and confirmation tokens ───────────────────────────────────────────
+def _preview_token(operation: str, insp: Dict[str, Any], prompt_sha256: Optional[str]) -> str:
+    status = insp["status"]
+    root: Path = insp["root"]
+    residue = insp["residue"]
+    backups = None
+    if operation == OPERATION_UNINSTALL and insp["manifest"] is not None:
+        manifest = insp["manifest"]
+        backups = {
+            "system": _file_sha256(root / manifest["system"]["backup"]) if manifest["system"]["backup"] else None,
+            "manifest": _file_sha256(root / manifest["previous_manifest"]["backup"]) if manifest["previous_manifest"]["backup"] else None,
+        }
+    journals = sorted(
+        ({"name": j["dir"].name, "phase": j["phase"], "sha256": j["sha256"]} for j in residue["live"] + residue["cleaning"]),
+        key=lambda j: j["name"],
+    )
+
+    def node_sha(key: str) -> Optional[str]:
+        fp = status["nodes"][key]["fingerprint"]
+        return fp["sha256"] if fp else None
+
+    payload = {
+        "schema": PREVIEW_TOKEN_SCHEMA,
+        "operation": operation,
+        "pi_dir": str(root),
+        "state": status["state"],
+        "system_sha256": node_sha("system"),
+        "manifest_sha256": node_sha("manifest"),
+        "prompt_sha256": prompt_sha256 if operation == OPERATION_DEPLOY else None,
+        "backups": backups,
+        "journals": journals,
+        "orphans": sorted(p.name for p in residue["markers"] + residue["temp_files"]),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _plan_writes(operation: str, insp: Dict[str, Any]) -> List[Dict[str, Any]]:
+    nodes = insp["status"]["nodes"]
+    writes: List[Dict[str, Any]] = []
+    if operation == OPERATION_DEPLOY:
+        for key, filename in (("system", SYSTEM_FILENAME), ("manifest", MANIFEST_FILENAME)):
+            if nodes[key]["kind"] == "regular":
+                writes.append({"path": filename, "action": "replace", "backup": f"{filename}.bak_<ts>"})
+            else:
+                writes.append({"path": filename, "action": "create"})
+        return writes
+    if operation == OPERATION_UNINSTALL:
+        manifest = insp["manifest"]
+        if manifest["system"]["before"] is None:
+            writes.append({"path": SYSTEM_FILENAME, "action": "remove"})
+        else:
+            writes.append({"path": SYSTEM_FILENAME, "action": "restore", "source": manifest["system"]["backup"]})
+        writes.append({"path": MANIFEST_FILENAME, "action": "archive", "archive": _manifest_archive_name("<ts>")})
+        if manifest["previous_manifest"]["before"] is not None:
+            writes.append({"path": MANIFEST_FILENAME, "action": "restore", "source": manifest["previous_manifest"]["backup"]})
+        return writes
+    residue = insp["residue"]
+    for journal in residue["live"]:
+        resources = journal["data"]["directories"][str(insp["root"])]["resources"]
+        for label, action in journal["actions"]:
+            write = {"path": resources[label]["path"], "action": action}
+            if action == "restore":
+                write["source"] = f"{journal['dir'].name}/{resources[label]['snapshot']}"
+            writes.append(write)
+        writes.append({"path": journal["dir"].name, "action": "cleanup"})
+    for journal in residue["cleaning"]:
+        writes.append({"path": journal["dir"].name, "action": "cleanup"})
+        writes.append({"path": journal["marker"].name, "action": "cleanup"})
+    for marker in residue["orphan_markers"]:
+        writes.append({"path": marker.name, "action": "cleanup"})
+    for temp in residue["temp_files"]:
+        writes.append({"path": temp.name, "action": "remove"})
+    return writes
+
+
+def _build_plan(operation: str, insp: Dict[str, Any], prompt: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    status = insp["status"]
+    if operation == OPERATION_DEPLOY:
+        blockers = list(status["blockers"]["deploy"])
+    elif operation == OPERATION_UNINSTALL:
+        blockers = list(status["blockers"]["uninstall"])
+    else:
+        blockers = list(status["conflicts"])
+        if not insp["is_dir"] and "pi-dir-missing" not in blockers:
+            blockers.append("pi-dir-missing")
+    prompt_sha = prompt["sha256"] if prompt else None
+    plan: Dict[str, Any] = {
+        "confirmation_token": None if blockers else _preview_token(operation, insp, prompt_sha),
+        "blockers": blockers,
+        "writes": [] if blockers else _plan_writes(operation, insp),
+        "preserves": list(PRESERVED_PATHS),
+    }
+    if operation == OPERATION_DEPLOY:
+        plan["prompt"] = {"name": prompt["name"], "source": prompt["source"], "sha256": prompt["sha256"], "size": prompt["size"]}
+    return plan
+
+
+# ─── Directory lock ──────────────────────────────────────────────────────────
+class _DirectoryLock:
+    """Non-blocking exclusive lock on `<pi_dir>/.pi-keysmith.lock` for confirmed writes."""
+
+    def __init__(self, root: Path):
+        self.path = root / LOCK_FILENAME
+        self.fd = -1
+
+    def __enter__(self) -> "_DirectoryLock":
+        try:
+            self.fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT | _O_NOFOLLOW | _O_BINARY, 0o600)
+            if not stat.S_ISREG(os.fstat(self.fd).st_mode):
+                raise IntegrityConflict(f"{LOCK_FILENAME}: not a regular file")
+        except OSError as exc:
+            self._close()
+            raise ContractExit(EXIT_BLOCKED, ["lock-unavailable"]) from exc
+        try:
+            if _is_windows_platform():
+                import msvcrt
+
+                msvcrt.locking(self.fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            self._close()
+            raise ContractExit(EXIT_LOCK_BUSY, ["lock-busy"]) from exc
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self._close()
+
+    def _close(self) -> None:
+        if self.fd >= 0:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = -1
+
+
+class _NoLock:
+    def __enter__(self) -> "_NoLock":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        return None
+
+
+# ─── Confirmed writes ────────────────────────────────────────────────────────
+def _write_result(root: Path, transaction_id: Optional[str], cleaned: List[str]) -> Dict[str, Any]:
+    return {
+        "transaction_id": transaction_id,
+        "applied": True,
+        "system_sha256": _file_sha256(root / SYSTEM_FILENAME),
+        "manifest_sha256": _file_sha256(root / MANIFEST_FILENAME),
+        "cleaned": cleaned,
+    }
+
+
+def _apply_deploy(insp: Dict[str, Any], prompt_bytes: bytes) -> Dict[str, Any]:
+    root: Path = insp["root"]
+    resolved = str(root)
+    sys_path = root / SYSTEM_FILENAME
+    man_path = root / MANIFEST_FILENAME
+    append_path = root / APPEND_SYSTEM_FILENAME
+    agents_path = root / AGENTS_FILENAME
     transaction_id = _new_transaction_id()
-    # For uninstall, system "after" target = manifest.system.before; manifest "after" = previous_manifest.before.
+    timestamp = _timestamp()
+    system_before = _portable_fingerprint(sys_path)
+    manifest_before = _portable_fingerprint(man_path)
+    journals = _create_deployment_journals(
+        [root], transaction_id, {resolved: system_before}, {resolved: manifest_before}, _sha256_bytes(prompt_bytes)
+    )
+    _update_journals(journals, PHASE_PREPARED)
+    system_backup: Optional[str] = None
+    if system_before is not None:
+        backup_path = _unique_path(root, _system_backup_name(timestamp))
+        _FILESYSTEM.copy_to_backup(sys_path, backup_path)
+        system_backup = backup_path.name
+    _update_journals(journals, PHASE_SYSTEM_INTENT)
+    _FILESYSTEM.atomic_write_bytes(sys_path, prompt_bytes, expected_fingerprint=system_before)
+    manifest_backup: Optional[str] = None
+    if manifest_before is not None:
+        backup_path = _unique_path(root, _manifest_backup_name(timestamp))
+        _FILESYSTEM.copy_to_backup(man_path, backup_path)
+        manifest_backup = backup_path.name
+    manifest = _build_deployment_manifest(
+        transaction_id=transaction_id,
+        system_before=system_before,
+        system_after=_portable_fingerprint(sys_path),
+        system_backup=system_backup,
+        append_system_path=APPEND_SYSTEM_FILENAME,
+        append_system_preserved=_is_regular_path(append_path),
+        append_system_fp=_portable_fingerprint(append_path),
+        agents_md_path=AGENTS_FILENAME,
+        agents_md_preserved=_is_regular_path(agents_path),
+        agents_md_fp=_portable_fingerprint(agents_path),
+        previous_manifest_before=manifest_before,
+        previous_manifest_backup=manifest_backup,
+    )
+    content = _serialize_manifest(manifest)
+    manifest_sha = _sha256_bytes(content.encode("utf-8"))
+    # Record the exact manifest bytes before publishing them so recovery can recognize them.
+    _update_journals(journals, PHASE_MANIFEST_INTENT, manifest_sha256={resolved: manifest_sha})
+    _FILESYSTEM.atomic_write_text(man_path, content, expected_fingerprint=manifest_before)
+    if not _path_has_fingerprint(sys_path, manifest["system"]["after"]):
+        raise IntegrityConflict(f"{SYSTEM_FILENAME}: post-deploy fingerprint drift")
+    if _file_sha256(man_path) != manifest_sha:
+        raise IntegrityConflict(f"{MANIFEST_FILENAME}: post-deploy manifest sha drift")
+    _update_journals(journals, PHASE_FINAL_SWEEP)
+    _update_journals(journals, PHASE_COMMITTED)
+    _cleanup_journal(root, transaction_id, PHASE_COMMITTED)
+    return _write_result(root, transaction_id, [])
+
+
+def _apply_uninstall(insp: Dict[str, Any]) -> Dict[str, Any]:
+    root: Path = insp["root"]
+    manifest = insp["manifest"]
+    sys_path = root / SYSTEM_FILENAME
+    man_path = root / MANIFEST_FILENAME
+    system_before = manifest["system"]["before"]
+    prev_before = manifest["previous_manifest"]["before"]
+    manifest_live = _portable_fingerprint(man_path)
+    transaction_id = _new_transaction_id()
+    timestamp = _timestamp()
     journals = _create_uninstall_journals(
-        [pi_dir],
-        transaction_id,
-        manifest,
-        system_after_fp=system_before,
-        previous_manifest_after=prev_before,
+        [root], transaction_id, manifest, system_after_fp=system_before, previous_manifest_after=prev_before
     )
     _update_journals(journals, PHASE_U_PREPARED)
+    _update_journals(journals, PHASE_U_SYSTEM_INTENT)
+    if system_before is None:
+        _FILESYSTEM.remove_owned_file(sys_path, manifest["system"]["after"])
+    else:
+        _FILESYSTEM.replace_owned_from_backup(root / manifest["system"]["backup"], sys_path, manifest["system"]["after"])
+    _update_journals(journals, PHASE_U_MANIFEST_INTENT)
+    _FILESYSTEM.copy_to_backup(man_path, _unique_path(root, _manifest_archive_name(timestamp)))
+    _FILESYSTEM.remove_owned_file(man_path, manifest_live)
+    if prev_before is not None:
+        _FILESYSTEM.replace_owned_from_backup(root / manifest["previous_manifest"]["backup"], man_path, None)
+    if not _path_has_fingerprint(sys_path, system_before):
+        raise IntegrityConflict(f"{SYSTEM_FILENAME}: not restored to its before state")
+    if not _path_has_fingerprint(man_path, prev_before):
+        raise IntegrityConflict(f"{MANIFEST_FILENAME}: not restored to the previous layer")
+    _update_journals(journals, PHASE_U_FINAL_SWEEP)
+    _update_journals(journals, PHASE_U_COMMITTED)
+    _cleanup_journal(root, transaction_id, PHASE_U_COMMITTED)
+    return _write_result(root, transaction_id, [])
+
+
+def _apply_recover(insp: Dict[str, Any]) -> Dict[str, Any]:
+    root: Path = insp["root"]
+    residue = insp["residue"]
+    cleaned: List[str] = []
+    transaction_id: Optional[str] = None
+    for temp in residue["temp_files"]:
+        if not _is_regular_path(temp):
+            raise IntegrityConflict(f"{temp.name}: not a regular file")
+        os.unlink(str(temp))
+        cleaned.append(temp.name)
+    for journal in residue["cleaning"]:
+        _remove_journal_dir(journal["dir"], journal["members"])
+        _remove_cleanup_intent(root, journal["transaction_id"])
+        cleaned.extend([journal["dir"].name, journal["marker"].name])
+        transaction_id = transaction_id or journal["transaction_id"]
+    for marker in residue["orphan_markers"]:
+        if not _is_regular_path(marker):
+            raise IntegrityConflict(f"{marker.name}: not a regular file")
+        os.unlink(str(marker))
+        cleaned.append(marker.name)
+        transaction_id = transaction_id or marker.name[len(CLEANUP_MARKER_PREFIX):-len(CLEANUP_MARKER_SUFFIX)]
+    for journal in residue["live"]:
+        data = journal["data"]
+        transaction_id = data["transaction_id"]
+        terminal_phase = data["phase"]
+        if not journal["terminal"]:
+            # Unfinished forward operation: reverse-restore manifest, then system.
+            journals = {str(root): data}
+            resources = data["directories"][str(root)]["resources"]
+            _update_journals(journals, PHASE_RECOVERING)
+            for label, action in journal["actions"]:
+                res = resources[label]
+                rpath = root / res["path"]
+                if action == "remove":
+                    _FILESYSTEM.remove_owned_file(rpath, _portable_fingerprint(rpath))
+                else:
+                    snapshot, _ = _read_regular_bytes_with_fingerprint(journal["dir"] / res["snapshot"])
+                    _FILESYSTEM.atomic_write_bytes(rpath, snapshot, expected_fingerprint=_portable_fingerprint(rpath))
+                if not _path_has_fingerprint(rpath, res["before"]):
+                    raise IntegrityConflict(f"{res['path']}: does not match its before state after recovery")
+            _update_journals(journals, PHASE_RECOVERED)
+            terminal_phase = PHASE_RECOVERED
+        # A terminal journal means the forward operation finished; only cleanup remains.
+        cleaned.append(_cleanup_journal(root, transaction_id, terminal_phase))
+    if cleaned:
+        _fsync_directory(root)
+    return _write_result(root, transaction_id, cleaned)
+
+
+# ─── Operations ──────────────────────────────────────────────────────────────
+_TOKEN_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _load_prompt(args) -> Tuple[bytes, Dict[str, Any]]:
     try:
-        # system-intent: restore SYSTEM.md from backup (or remove if it was created).
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        if system_before is None:
-            if sys_path.exists():
-                os.unlink(str(sys_path))
-                _fsync_directory(pi_dir)
-        else:
-            backup_path = pi_dir / system_backup_name
-            _FILESYSTEM.replace_owned_from_backup(backup_path, sys_path, manifest["system"]["after"])
-        _update_journals(journals, PHASE_U_SYSTEM_INTENT)
-        # manifest-intent: archive current manifest, restore previous if present.
-        archive_path = _unique_archive_path(pi_dir, _manifest_archive_name(timestamp))
-        # Move current manifest to archive via copy-then-remove (atomic move across same dir).
-        _FILESYSTEM.copy_to_backup(man_path, archive_path)
-        os.unlink(str(man_path))
-        _fsync_directory(pi_dir)
-        if prev_before is not None:
-            prev_backup_path = pi_dir / prev_backup_name
-            _FILESYSTEM.replace_owned_from_backup(prev_backup_path, man_path, None)
-        _update_journals(journals, PHASE_U_MANIFEST_INTENT)
-        # final-sweep: verify system matches before; manifest matches prev_before or absent.
-        if not _path_has_fingerprint(sys_path, system_before):
-            raise IntegrityConflict(f"{sys_path}: 卸载后 SYSTEM.md 未恢复到 before")
-        if prev_before is not None:
-            if not _path_has_fingerprint(man_path, prev_before):
-                raise IntegrityConflict(f"{man_path}: 卸载后 manifest 未恢复到上一层")
-        else:
-            if man_path.exists():
-                raise IntegrityConflict(f"{man_path}: 卸载后 manifest 应不存在")
-        _update_journals(journals, PHASE_U_FINAL_SWEEP)
-        _update_journals(journals, PHASE_U_COMMITTED)
-        # Cleanup journal.
-        jdir = _journal_dir(pi_dir, transaction_id)
-        members = _enumerate_journal_members(jdir)
-        _publish_cleanup_intent(pi_dir, transaction_id, members, PHASE_U_COMMITTED)
-        _safe_remove_journal(pi_dir, transaction_id, members)
-        _remove_cleanup_intent(pi_dir, transaction_id)
-    except BaseException:
-        raise
-    _print(_tr("uninstalled"))
+        content = load_md_content(args.file)
+    except (IntegrityConflict, OSError, UnicodeDecodeError) as exc:
+        raise UsageError("prompt-file-invalid") from exc
+    data = content.encode("utf-8")
+    prompt = {
+        "name": args.name,
+        "source": "file" if args.file else "builtin",
+        "sha256": _sha256_bytes(data),
+        "size": len(data),
+    }
+    return data, prompt
 
 
-def uninstall(pi_dirs: List[str], yes: bool) -> None:
-    _uninstall_locked(pi_dirs, yes)
+def _run_operation(operation: str, pi_dir: Path, args) -> Dict[str, Any]:
+    """Run one operation and return the envelope body (without schema metadata)."""
+    out: Dict[str, Any] = {
+        "operation": operation,
+        "preview": True,
+        "apply": False,
+        "ok": True,
+        "exit_code": EXIT_OK,
+        "status": None,
+        "plan": None,
+        "result": None,
+        "diagnostics": [],
+    }
+    prompt_bytes: Optional[bytes] = None
+    prompt: Optional[Dict[str, Any]] = None
+    if operation == OPERATION_DEPLOY:
+        prompt_bytes, prompt = _load_prompt(args)
+        if _is_windows_platform():
+            out["diagnostics"].append(_diagnostic("windows-beta"))
+
+    insp = _inspect(pi_dir)
+    out["status"] = insp["status"]
+    if operation == OPERATION_STATUS:
+        if insp["status"]["state"] in (STATE_CONFLICT, STATE_RECOVERY_REQUIRED):
+            out["ok"] = False
+            out["exit_code"] = EXIT_BLOCKED
+        out["diagnostics"].extend(_diagnostic(c) for c in insp["status"]["conflicts"] + insp["status"]["drift"])
+        return out
+
+    plan = _build_plan(operation, insp, prompt)
+    out["plan"] = plan
+    if operation == OPERATION_UNINSTALL and not plan["blockers"]:
+        out["diagnostics"].extend(_diagnostic(f"preserved-changed:{key}") for key in insp["status"]["preserved_changed"])
+    if not args.yes:
+        if plan["blockers"]:
+            out["ok"] = False
+            out["exit_code"] = EXIT_BLOCKED
+            out["diagnostics"].extend(_diagnostic(c) for c in plan["blockers"])
+        return out
+
+    try:
+        _confirm(operation, pi_dir, insp, args, prompt, prompt_bytes, out)
+    except ContractExit as exc:
+        out["ok"] = False
+        out["exit_code"] = exc.exit_code
+        out["result"] = None
+        out["diagnostics"].extend(_diagnostic(code, exc.detail) for code in exc.codes)
+    return out
+
+
+def _confirm(
+    operation: str,
+    pi_dir: Path,
+    insp: Dict[str, Any],
+    args,
+    prompt: Optional[Dict[str, Any]],
+    prompt_bytes: Optional[bytes],
+    out: Dict[str, Any],
+) -> None:
+    """Confirmed write: re-inspect under the directory lock and re-check the token."""
+    lock = _DirectoryLock(insp["root"]) if insp["is_dir"] else _NoLock()
+    with lock:
+        insp = _inspect(pi_dir)
+        plan = _build_plan(operation, insp, prompt)
+        out["plan"] = plan
+        out["status"] = insp["status"]
+        # The token binds the preview's snapshot; any change since then is a
+        # mismatch even if it also produced a blocker.
+        expected = args.expected_preview_token
+        if expected is not None and expected != _preview_token(operation, insp, prompt["sha256"] if prompt else None):
+            raise ContractExit(EXIT_TOKEN_MISMATCH, ["preview-token-mismatch"])
+        if plan["blockers"]:
+            raise ContractExit(EXIT_BLOCKED, plan["blockers"])
+        out["apply"] = True
+        out["preview"] = False
+        try:
+            if operation == OPERATION_DEPLOY:
+                assert prompt_bytes is not None
+                out["result"] = _apply_deploy(insp, prompt_bytes)
+            elif operation == OPERATION_UNINSTALL:
+                out["result"] = _apply_uninstall(insp)
+            else:
+                out["result"] = _apply_recover(insp) if plan["writes"] else {
+                    "transaction_id": None,
+                    "applied": True,
+                    "system_sha256": _file_sha256(insp["root"] / SYSTEM_FILENAME),
+                    "manifest_sha256": _file_sha256(insp["root"] / MANIFEST_FILENAME),
+                    "cleaned": [],
+                }
+        except (OSError, AssertionError) as exc:
+            out["status"] = _inspect(pi_dir)["status"]
+            raise ContractExit(EXIT_WRITE_FAILED, ["write-failed"], detail=type(exc).__name__) from exc
+        out["status"] = _inspect(pi_dir)["status"]
+
+
+# ─── Envelope ────────────────────────────────────────────────────────────────
+def _envelope(operation: Optional[str], pi_dir: Optional[Path], body: Dict[str, Any]) -> Dict[str, Any]:
+    target: Dict[str, Any] = {}
+    if pi_dir is not None:
+        target = {"pi_dir": str(pi_dir), "pi_dir_resolved": os.path.realpath(str(pi_dir)), "scope": "user"}
+    return {
+        "schema": ENVELOPE_SCHEMA,
+        "tool": TOOL_NAME,
+        "version": VERSION,
+        "operation": operation,
+        "preview": body.get("preview", True),
+        "apply": body.get("apply", False),
+        "ok": body["ok"],
+        "exit_code": body["exit_code"],
+        "target": target,
+        "status": body.get("status"),
+        "plan": body.get("plan"),
+        "result": body.get("result"),
+        "diagnostics": body.get("diagnostics", []),
+    }
+
+
+def _emit_json(envelope: Dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(envelope, ensure_ascii=False, sort_keys=False) + "\n")
+    sys.stdout.flush()
+
+
+# ─── Human output ────────────────────────────────────────────────────────────
+def _print_status(status: Dict[str, Any]) -> None:
+    labels = {
+        "system": "SYSTEM.md",
+        "append_system": "APPEND_SYSTEM.md",
+        "agents_md": "AGENTS.md",
+        "claude_md": "CLAUDE.md",
+        "manifest": _tr("deploy_manifest"),
+    }
+    _print(_tr("status_dir").format(dir=status["nodes"]["pi_dir"]["path"]))
+    for key, label in labels.items():
+        node = status["nodes"][key]
+        _print(f"    {label}: {node['kind']} ({node['path']})")
+        if key == "manifest" and status["manifest"] is not None:
+            manifest = status["manifest"]
+            _print(f"        deployment_id: {manifest['deployment_id']}")
+            _print(f"        system.after.sha256: {manifest['system']['after']['sha256']}")
+            _print(f"        append_system.preserved: {manifest['append_system']['preserved']}")
+            _print(f"        agents_md.preserved: {manifest['agents_md']['preserved']}")
+    residue = status["residue"]
+    parts = []
+    if residue["journals"]:
+        parts.append(f"{len(residue['journals'])} journal dir(s)")
+    if residue["cleanup_markers"]:
+        parts.append(f"{len(residue['cleanup_markers'])} cleanup marker(s)")
+    if residue["temp_files"]:
+        parts.append(f"{len(residue['temp_files'])} temp file(s)")
+    _print(f"    {_tr('transaction_residue')}: {', '.join(parts) if parts else _tr('none_word')}")
+    _print(f"    {_tr('state_label')}: {status['state']}")
+    for code in status["conflicts"] + status["drift"]:
+        _print(f"    - {_diagnostic(code)}")
+    _print(f"    {_tr('uninstall_readiness')}: {_tr('ready') if status['uninstall_ready'] else _tr('blocked')}")
+    _print(f"    {_tr('deployability')}: {_tr('ready') if status['deployable'] else _tr('blocked')}")
+
+
+def _print_human(body: Dict[str, Any], args) -> None:
+    operation = body["operation"]
+    plan = body["plan"]
+    if operation == OPERATION_STATUS:
+        _print(_tr("found_dirs").format(n=1))
+        _print_status(body["status"])
+        return
+    if operation == OPERATION_DEPLOY and plan is not None:
+        prompt = plan["prompt"]
+        if prompt["source"] == "builtin":
+            _print(_tr("prompt_source_builtin").format(sha=prompt["sha256"]))
+        else:
+            _print(_tr("prompt_source_external").format(path=args.file, sha=prompt["sha256"]))
+        _print(_tr("behavior_notice_title").format(name=TOOL_NAME))
+        _print(_tr("behavior_notice_preserve"))
+        _print_windows_fresh_deployment_beta_warning()
+    if not body["ok"]:
+        for line in body["diagnostics"]:
+            _print(f"[{_localized('阻止', 'Blocked')}] {line}")
+        return
+    for line in body["diagnostics"]:
+        if line.startswith("preserved-changed:"):
+            _print(f"[{_localized('警告', 'Warning')}] {line}")
+    if body["result"] is None:
+        _print(_tr({OPERATION_DEPLOY: "preview_only", OPERATION_UNINSTALL: "uninstall_preview_only"}.get(operation, "recover_preview_only")))
+        for write in plan["writes"]:
+            _print(f"    {write['action']}: {write['path']}")
+        if plan["writes"]:
+            _print(_localized(
+                "确认请追加 --yes（可选 --expected-preview-token 绑定本次预览）：",
+                "Confirm with --yes (optionally --expected-preview-token to bind this preview):",
+            ))
+            _print(f"    --expected-preview-token {plan['confirmation_token']}")
+        return
+    result = body["result"]
+    if operation == OPERATION_DEPLOY:
+        _print(_tr("deployed").format(path=Path(body["status"]["nodes"]["system"]["path"])))
+    elif operation == OPERATION_UNINSTALL:
+        _print(_tr("uninstalled"))
+    elif result["cleaned"]:
+        _print(_tr("recovered").format(tid=result["transaction_id"]))
+        for name in result["cleaned"]:
+            _print(f"    cleaned: {name}")
+    else:
+        _print(_tr("nothing_to_recover"))
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
+class _ArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str):  # type: ignore[override]
+        raise UsageError("usage-error", message)
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _ArgumentParser(
         prog=TOOL_NAME,
         description=_localized(
             "为本地 pi 配置目录部署版本化指令（SYSTEM.md），支持预览、所有权清单、中断恢复与分层卸载。",
@@ -1784,68 +2205,99 @@ def _build_parser() -> argparse.ArgumentParser:
     operation_group.add_argument("--uninstall", action="store_true", help=_localized("预览或撤销最新一层受管理部署", "Preview or remove the newest managed layer"))
     operation_group.add_argument("--recover", action="store_true", help=_localized("预览或恢复中断的 deploy/uninstall", "Preview or restore an interrupted deploy/uninstall"))
     parser.add_argument("--yes", action="store_true", help=_localized("确认部署、卸载或恢复", "Confirm deploy, uninstall, or recovery"))
-    parser.add_argument("--pi-dir", default=None, help=_localized("显式选择单个 pi 配置目录", "Explicitly select one pi configuration directory"))
+    parser.add_argument("--json", action="store_true", help=_localized("stdout 只输出一个 pi-keysmith.envelope.v1 JSON 对象", "Print exactly one pi-keysmith.envelope.v1 JSON object on stdout"))
+    parser.add_argument("--expected-preview-token", default=None, metavar="TOKEN", help=_localized("确认写时绑定预览的 plan.confirmation_token", "Bind a confirmed write to the preview's plan.confirmation_token"))
+    parser.add_argument("--pi-dir", default=None, help=_localized("显式选择单个 pi 配置目录（--json 时必填且须为绝对路径）", "Explicitly select one pi configuration directory (required and absolute with --json)"))
     parser.add_argument("--lang", choices=("auto", "zh-CN", "en"), default="auto", help=_localized("CLI 输出语言", "CLI output language"))
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
 
-def deploy(args, pi_dirs: Optional[List[str]] = None) -> None:
-    _deploy_locked(args, pi_dirs=[Path(d) for d in pi_dirs] if pi_dirs else None)
-
-
-def main() -> None:
-    _configure_output_streams()
-    lang = _language_from_argv(sys.argv)
-    _set_output_language(lang)
-    parser = _build_parser()
-    raw = parser.parse_args()
-    # Detect explicitly-provided --file/--name before default-filling SUPPRESS args.
-    file_explicit = hasattr(raw, "file")
-    name_explicit = hasattr(raw, "name")
-    args = raw
-    # Default-fill SUPPRESS args.
-    if not hasattr(args, "file"):
+def _parse(parser: argparse.ArgumentParser, argv: List[str]) -> Tuple[Any, str]:
+    args = parser.parse_args(argv)
+    file_explicit = hasattr(args, "file")
+    name_explicit = hasattr(args, "name")
+    if not file_explicit:
         args.file = None
-    if not hasattr(args, "name"):
+    if not name_explicit:
         args.name = DEFAULT_NAME
-    # Manual cross-checks: operation modes reject explicitly-provided deploy args.
     if args.status:
-        if file_explicit:
-            parser.error("--status 与 --file 互斥 / --status conflicts with --file")
-        if name_explicit:
-            parser.error("--status 与 --name 互斥 / --status conflicts with --name")
-        if args.yes:
-            parser.error("--status 与 --yes 互斥 / --status conflicts with --yes")
-    if args.uninstall and (file_explicit or name_explicit):
-        parser.error("--uninstall 与 --file/--name 互斥 / --uninstall conflicts with --file/--name")
-    if args.recover and (file_explicit or name_explicit):
-        parser.error("--recover 与 --file/--name 互斥 / --recover conflicts with --file/--name")
-    # Resolve pi dir.
-    pi_dirs: Optional[List[str]] = None
-    if args.pi_dir:
-        resolved = _resolve_pi_dir(args.pi_dir)
-        if resolved is None or not resolved.is_dir():
-            _print(_localized(f"[错误] 指定的 pi 目录不存在: {args.pi_dir}", f"[Error] Specified pi directory does not exist: {args.pi_dir}"))
-            sys.exit(1)
-        pi_dirs = [str(resolved)]
-    if args.status:
-        dirs = pi_dirs if pi_dirs is not None else find_pi_dirs()
-        show_status(dirs)
-        return
-    if args.uninstall:
-        dirs = pi_dirs if pi_dirs is not None else find_pi_dirs()
-        uninstall(dirs, args.yes)
-        return
-    if args.recover:
-        dirs = pi_dirs if pi_dirs is not None else find_pi_dirs()
-        recover_deployment(dirs, args.yes)
-        return
-    # Default: deploy (dry-run unless --yes).
-    if not args.yes:
-        args.dry_run = True
-    deploy(args, pi_dirs=pi_dirs)
+        if file_explicit or name_explicit or args.yes:
+            raise UsageError("usage-error", "--status conflicts with --file/--name/--yes")
+        operation = OPERATION_STATUS
+    elif args.uninstall or args.recover:
+        if file_explicit or name_explicit:
+            raise UsageError("usage-error", "--uninstall/--recover conflict with --file/--name")
+        operation = OPERATION_UNINSTALL if args.uninstall else OPERATION_RECOVER
+    else:
+        operation = OPERATION_DEPLOY
+        if args.dry_run:
+            # --dry-run is always a pure preview, even alongside --yes.
+            args.yes = False
+    if name_explicit and not _NAME_RE.fullmatch(args.name or ""):
+        raise UsageError("name-invalid")
+    confirmed = args.yes and operation != OPERATION_STATUS
+    if args.expected_preview_token is not None:
+        if not confirmed:
+            raise UsageError("preview-token-unexpected")
+        if not _TOKEN_RE.fullmatch(args.expected_preview_token):
+            raise UsageError("preview-token-invalid")
+    if args.json:
+        if not args.pi_dir:
+            raise UsageError("pi-dir-required")
+        if not os.path.isabs(args.pi_dir):
+            raise UsageError("pi-dir-not-absolute")
+        if confirmed and args.expected_preview_token is None:
+            raise UsageError("preview-token-required")
+    return args, operation
+
+
+def _json_wanted(argv: List[str]) -> bool:
+    return "--json" in argv
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    _configure_output_streams()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    _set_output_language(_language_from_argv(argv))
+    json_mode = _json_wanted(argv)
+    parser = _build_parser()
+    operation: Optional[str] = None
+    pi_dir: Optional[Path] = None
+    try:
+        args, operation = _parse(parser, argv)
+        json_mode = args.json
+        if args.pi_dir:
+            pi_dir = Path(args.pi_dir).expanduser()
+        elif not json_mode:
+            pi_dir = _resolve_pi_dir(None)
+            if pi_dir is None:
+                _print(_tr("no_pi_dirs"))
+                return EXIT_BLOCKED
+        assert pi_dir is not None
+        if not json_mode:
+            # Human mode keeps the 0.1.0 behavior for these two edge cases.
+            if not pi_dir.is_dir():
+                _print(_localized(f"[错误] 指定的 pi 目录不存在: {pi_dir}", f"[Error] Specified pi directory does not exist: {pi_dir}"))
+                return EXIT_BLOCKED
+            if operation == OPERATION_UNINSTALL and _classify_node(pi_dir / MANIFEST_FILENAME) == "missing":
+                _print(_tr("no_manifest_noop"))
+                return EXIT_OK
+        body = _run_operation(operation, pi_dir, args)
+    except UsageError as exc:
+        if not json_mode:
+            parser.print_usage(sys.stderr)
+            sys.stderr.write(f"{TOOL_NAME}: error: {_diagnostic(exc.code, exc.detail)}\n")
+            return EXIT_USAGE
+        body = {"ok": False, "exit_code": EXIT_USAGE, "diagnostics": [_diagnostic(exc.code, exc.detail)]}
+        _emit_json(_envelope(operation, pi_dir, body))
+        return EXIT_USAGE
+    if json_mode:
+        _emit_json(_envelope(operation, pi_dir, body))
+    else:
+        _print_human(body, args)
+    return body["exit_code"]
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

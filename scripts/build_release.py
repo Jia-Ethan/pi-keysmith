@@ -34,6 +34,7 @@ ARCHIVE_FILES = [
     "VERSION",
     "pi-keysmith.py",
     "docs/hooks-transactions.md",
+    "docs/json-contract.md",
     "examples/system-prompt.md",
 ]
 CLI_VERSION_PATTERN = re.compile(rb"^(?:__version__|VERSION)\s*=\s*['\"]([^'\"]+)['\"]\s*$", re.MULTILINE)

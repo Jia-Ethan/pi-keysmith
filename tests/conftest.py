@@ -45,6 +45,7 @@ def run_cli(args: list, *, expect_code: int = 0) -> tuple[int, str, str]:
         [sys.executable, str(CLI_PATH), *args],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         env=env,
         cwd=str(REPO_ROOT),
     )

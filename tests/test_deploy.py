@@ -27,14 +27,14 @@ def _deploy(pi_agent: Path, extra=None) -> tuple[int, str]:
     args = ["--pi-dir", str(pi_agent), "--yes", "--lang", "en"]
     if extra:
         args.extend(extra)
-    proc = subprocess.run([sys.executable, str(CLI_PATH), *args], capture_output=True, text=True)
+    proc = subprocess.run([sys.executable, str(CLI_PATH), *args], capture_output=True, text=True, encoding="utf-8")
     return proc.returncode, proc.stdout + proc.stderr
 
 
 def _status(pi_agent: Path) -> str:
     proc = subprocess.run(
         [sys.executable, str(CLI_PATH), "--pi-dir", str(pi_agent), "--status", "--lang", "en"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
     )
     return proc.stdout + proc.stderr
 
@@ -43,7 +43,7 @@ def _uninstall(pi_agent: Path, yes=True) -> int:
     args = ["--pi-dir", str(pi_agent), "--uninstall", "--lang", "en"]
     if yes:
         args.append("--yes")
-    proc = subprocess.run([sys.executable, str(CLI_PATH), *args], capture_output=True, text=True)
+    proc = subprocess.run([sys.executable, str(CLI_PATH), *args], capture_output=True, text=True, encoding="utf-8")
     return proc.returncode
 
 
@@ -51,7 +51,7 @@ def _recover(pi_agent: Path, yes=True) -> int:
     args = ["--pi-dir", str(pi_agent), "--recover", "--lang", "en"]
     if yes:
         args.append("--yes")
-    proc = subprocess.run([sys.executable, str(CLI_PATH), *args], capture_output=True, text=True)
+    proc = subprocess.run([sys.executable, str(CLI_PATH), *args], capture_output=True, text=True, encoding="utf-8")
     return proc.returncode
 
 
@@ -69,7 +69,7 @@ def test_deploy_creates_system_md_and_manifest(pi_agent):
     # Manifest structure.
     m = json.loads(man.read_text(encoding="utf-8"))
     assert m["schema_version"] == 1
-    assert m["tool_version"] == "0.1.0"
+    assert m["tool_version"] == "0.2.0"
     assert m["system"]["path"] == "SYSTEM.md"
     assert m["system"]["before"] is None
     assert m["system"]["after"]["sha256"] == PROMPT_SHA
@@ -80,8 +80,8 @@ def test_deploy_creates_system_md_and_manifest(pi_agent):
 
 
 def test_deploy_preserves_append_system_and_agents_md(pi_agent):
-    (pi_agent / "APPEND_SYSTEM.md").write_text("PERSONA-CARD\n", encoding="utf-8")
-    (pi_agent / "AGENTS.md").write_text("GLOBAL-INSTRUCTIONS\n", encoding="utf-8")
+    (pi_agent / "APPEND_SYSTEM.md").write_bytes(b"PERSONA-CARD\n")
+    (pi_agent / "AGENTS.md").write_bytes(b"GLOBAL-INSTRUCTIONS\n")
     persona_before = (pi_agent / "APPEND_SYSTEM.md").read_bytes()
     agents_before = (pi_agent / "AGENTS.md").read_bytes()
     code, out = _deploy(pi_agent)
@@ -154,7 +154,7 @@ def test_uninstall_preview_writes_nothing(pi_agent):
     _deploy(pi_agent)
     proc = subprocess.run(
         [sys.executable, str(CLI_PATH), "--pi-dir", str(pi_agent), "--uninstall", "--lang", "en"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
     )
     assert proc.returncode == 0
     assert (pi_agent / SYSTEM_NAME).exists()
@@ -163,7 +163,7 @@ def test_uninstall_preview_writes_nothing(pi_agent):
 
 def test_custom_prompt_deploy(run, pi_agent, tmp_path):
     custom = tmp_path / "custom.md"
-    custom.write_text("CUSTOM-PROMPT-CONTENT\n", encoding="utf-8")
+    custom.write_bytes(b"CUSTOM-PROMPT-CONTENT\n")
     code, out, _ = run(["--pi-dir", str(pi_agent), "--yes", "--file", str(custom), "--name", "custom-rules", "--lang", "en"])
     assert code == 0
     # Deploy target is always SYSTEM.md, regardless of --name.
