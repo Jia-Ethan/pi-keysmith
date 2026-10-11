@@ -69,7 +69,7 @@ def test_deploy_creates_system_md_and_manifest(pi_agent):
     # Manifest structure.
     m = json.loads(man.read_text(encoding="utf-8"))
     assert m["schema_version"] == 1
-    assert m["tool_version"] == "0.1.0"
+    assert m["tool_version"] == "0.2.0"
     assert m["system"]["path"] == "SYSTEM.md"
     assert m["system"]["before"] is None
     assert m["system"]["after"]["sha256"] == PROMPT_SHA

@@ -17,14 +17,14 @@ def test_embedded_prompt_byte_identical_to_example(cli):
 
 
 def test_version_matches_version_file(cli):
-    assert cli.VERSION == "0.1.0"
-    assert (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip() == "0.1.0"
+    assert cli.VERSION == "0.2.0"
+    assert (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip() == "0.2.0"
 
 
 def test_cli_version_flag(run):
     code, out, _ = run(["--version"])
     assert code == 0
-    assert "pi-keysmith" in out and "0.1.0" in out
+    assert "pi-keysmith" in out and "0.2.0" in out
 
 
 def test_cli_help_lists_operations(run):

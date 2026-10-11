@@ -56,19 +56,22 @@ and restores the previous manifest layer if one was recorded.
 
 ## Recovery
 
-`--recover` (default preview; `--yes` to apply):
+`--recover` (default preview; `--yes` to apply) handles one pi directory:
 
-- discovers `.pi-keysmith-transaction-<id>/` journals across the selected
-  directories;
-- dispatches by the journal's immutable `operation` (`deploy` or `uninstall`);
-- requires a single transaction id across all selected participants;
-- preflights that every live managed resource is either its recorded `before`
-  state, one of its allowed `after` states, or absent when allowed;
-- on `--yes`, reverses participants and restores resources in order
-  `manifest -> system` from before-state snapshots, then cleans up the journal.
+- an unfinished `.pi-keysmith-transaction-<id>/` journal is reverse-restored
+  (`manifest -> system`) from its before-state snapshots after checking that
+  every live resource is its `before` state, an allowed `after` state, or
+  absent when allowed; then the journal is cleaned up;
+- a terminal journal (`committed` / `recovered`) is only cleaned up — the
+  forward operation already finished and is never rolled back;
+- a journal with a matching cleanup marker (cleanup was interrupted) has its
+  cleanup finished;
+- orphan cleanup markers and `.keysmith-*` temp files are removed.
 
-Mixed deploy/uninstall transactions in one recovery scope are refused; select a
-participant of each transaction separately.
+More than one unfinished transaction, an unparseable journal or marker, or a
+resource in an unexpected state is reported as a conflict and left for manual
+review. Confirmed writes hold `.pi-keysmith.lock`. See `docs/json-contract.md`
+for the machine-readable state machine.
 
 ## Filesystem boundaries
 
