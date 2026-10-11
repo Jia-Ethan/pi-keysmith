@@ -614,22 +614,6 @@ class _PosixFilesystem:
                 except OSError:
                     pass
 
-    def atomic_move(self, source: Path, dest: Path, expected_fingerprint: Optional[Dict[str, Any]] = None) -> None:
-        """Atomically move `source` onto `dest`. Destination must be absent or
-        match `expected_fingerprint` (which may be None for 'must be absent')."""
-        if dest.is_symlink() or (dest.exists() and not _is_regular_path(dest)):
-            raise IntegrityConflict(f"{dest}: not a regular file; refuse to replace")
-        if not _is_regular_path(source):
-            raise IntegrityConflict(f"{source}: source must be a regular file")
-        if expected_fingerprint is None:
-            if dest.exists():
-                raise IntegrityConflict(f"{dest}: destination exists; no-replace move refused")
-        else:
-            if not _path_has_fingerprint(dest, expected_fingerprint):
-                raise IntegrityConflict(f"{dest}: current content does not match expected; concurrent drift refused")
-        os.replace(str(source), str(dest))
-        _fsync_directory(dest.parent)
-
     def remove_owned_file(self, path: Path, expected: Dict[str, Any]) -> None:
         if not _path_has_fingerprint(path, expected):
             raise IntegrityConflict(f"{path}: current content does not match expected; refuse to remove")
@@ -855,19 +839,6 @@ def _publish_journal_pending(journal_dir: Path, journal: Dict[str, Any]) -> None
     if _is_regular_path(pending_path):
         os.unlink(str(pending_path))
     _FILESYSTEM.write_private_text(pending_path, json.dumps(persisted, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-
-
-def _reconcile_pending(journal_dir: Path) -> None:
-    pending = journal_dir / JOURNAL_PENDING_FILENAME
-    journal = journal_dir / JOURNAL_FILENAME
-    if pending.exists() and _is_regular_path(pending):
-        if not journal.exists() or not _is_regular_path(journal):
-            data, _ = _read_regular_bytes_with_fingerprint(pending)
-            _FILESYSTEM.atomic_write_text(journal, data.decode("utf-8"))
-        try:
-            os.unlink(str(pending))
-        except OSError:
-            pass
 
 
 def _load_journal_file(path: Path) -> Dict[str, Any]:

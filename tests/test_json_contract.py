@@ -575,3 +575,195 @@ def test_human_mode_still_text(run, pi_agent):
     assert code == 0
     assert not out.lstrip().startswith("{")
     assert "Deployability: ready" in out
+
+
+# ─── Additional edge coverage ────────────────────────────────────────────────
+def test_recover_finishes_interrupted_cleanup(pi_agent, cli):
+    """Killed after the cleanup marker was published but before the journal was removed."""
+    token = plan_deploy(pi_agent)["plan"]["confirmation_token"]
+    kill = (
+        "import os\n"
+        "_orig = cli._remove_journal_dir\n"
+        "def _patched(*a, **k):\n"
+        "    os._exit(9)\n"
+        "cli._remove_journal_dir = _patched\n"
+    )
+    code, _, _ = _invoke(["--yes", "--json", "--pi-dir", str(pi_agent), "--expected-preview-token", token], extra_code=kill)
+    assert code == 9
+    st = status(pi_agent, expect=1)["status"]
+    assert st["state"] == "recovery-required"
+    assert len(st["residue"]["journals"]) == 1 and len(st["residue"]["cleanup_markers"]) == 1
+    deployed = (pi_agent / SYSTEM_NAME).read_bytes()
+    plan = plan_op("recover", pi_agent)["plan"]
+    assert [w["action"] for w in plan["writes"]] == ["cleanup", "cleanup"]
+    env = confirm_op("recover", pi_agent, plan["confirmation_token"])
+    assert len(env["result"]["cleaned"]) == 2
+    assert (pi_agent / SYSTEM_NAME).read_bytes() == deployed
+    assert env["status"]["state"] == "active-aligned"
+
+
+def test_tampered_interrupted_cleanup_is_conflict(pi_agent, cli):
+    token = plan_deploy(pi_agent)["plan"]["confirmation_token"]
+    kill = "import os\ncli._remove_journal_dir = lambda *a, **k: os._exit(9)\n"
+    _invoke(["--yes", "--json", "--pi-dir", str(pi_agent), "--expected-preview-token", token], extra_code=kill)
+    jdir = next(p for p in pi_agent.iterdir() if p.name.startswith(JOURNAL_PREFIX))
+    (jdir / "extra").write_text("x", encoding="utf-8")
+    st = status(pi_agent, expect=1)["status"]
+    assert st["state"] == "conflict" and "journal-invalid" in st["conflicts"]
+    assert plan_op("recover", pi_agent, expect=1)["plan"]["writes"] == []
+
+
+def test_two_unfinished_journals_are_ambiguous(pi_agent, cli):
+    simulate_journal(cli, pi_agent)
+    resolved = str(pi_agent.resolve())
+    cli._create_deployment_journals(
+        [pi_agent], "0123456789abcdef0123456789abcdef", {resolved: None}, {resolved: None}, cli._prompt_sha256("X")
+    )
+    st = status(pi_agent, expect=1)["status"]
+    assert st["state"] == "conflict" and "journal-ambiguous" in st["conflicts"]
+
+
+def test_unexpected_resource_blocks_recover(pi_agent, cli):
+    simulate_journal(cli, pi_agent)
+    (pi_agent / SYSTEM_NAME).write_text("SOMEONE ELSE\n", encoding="utf-8")
+    st = status(pi_agent, expect=1)["status"]
+    assert "recover-resource-unexpected:system" in st["conflicts"]
+    env = plan_op("recover", pi_agent, expect=1)
+    assert env["plan"]["confirmation_token"] is None
+
+
+def test_residue_and_marker_edge_cases(pi_agent, cli):
+    (pi_agent / ".keysmith-dir").mkdir()
+    (pi_agent / f".pi-keysmith-cleanup-{TID}.intent.json").write_text("{broken", encoding="utf-8")
+    (pi_agent / f"{JOURNAL_PREFIX}notadir").write_text("x", encoding="utf-8")
+    st = status(pi_agent, expect=1)["status"]
+    assert {"residue-not-regular", "journal-invalid"} <= set(st["conflicts"])
+
+
+def test_special_nodes_and_manifest_dir(pi_agent):
+    (pi_agent / MANIFEST_NAME).mkdir()
+    os.mkfifo(str(pi_agent / "CLAUDE.md"))
+    st = status(pi_agent, expect=1)["status"]
+    assert st["nodes"]["manifest"]["kind"] == "directory"
+    assert st["nodes"]["claude_md"]["kind"] == "special"
+    assert "manifest-not-regular" in st["conflicts"]
+    assert "preserved-not-regular:claude_md" in st["blockers"]["deploy"]
+
+
+def test_backup_missing_blocks_uninstall(pi_agent):
+    (pi_agent / SYSTEM_NAME).write_text("ORIGINAL\n", encoding="utf-8")
+    deploy(pi_agent)
+    deploy(pi_agent)
+    for p in list(pi_agent.iterdir()):
+        if p.name.startswith(("SYSTEM.md.bak_", f"{MANIFEST_NAME}.bak_")):
+            p.unlink()
+    st = status(pi_agent)["status"]
+    assert {"system-backup-missing", "manifest-backup-missing"} <= set(st["blockers"]["uninstall"])
+
+
+def test_layered_uninstall_restores_previous_manifest(pi_agent):
+    deploy(pi_agent)
+    first_manifest = (pi_agent / MANIFEST_NAME).read_bytes()
+    deploy(pi_agent)
+    plan = plan_op("uninstall", pi_agent)["plan"]
+    assert [w["action"] for w in plan["writes"]] == ["restore", "archive", "restore"]
+    confirm_op("uninstall", pi_agent, plan["confirmation_token"])
+    assert (pi_agent / MANIFEST_NAME).read_bytes() == first_manifest
+    assert status(pi_agent)["status"]["state"] == "active-aligned"
+
+
+def test_write_failure_exit_4(pi_agent):
+    token = plan_deploy(pi_agent)["plan"]["confirmation_token"]
+    fail = (
+        "_orig = cli._FILESYSTEM.atomic_write_bytes\n"
+        "def _boom(path, *a, **k):\n"
+        "    if path.name == 'SYSTEM.md':\n"
+        "        raise OSError('disk full')\n"
+        "    return _orig(path, *a, **k)\n"
+        "cli._FILESYSTEM.atomic_write_bytes = _boom\n"
+    )
+    env = confirm_deploy(pi_agent, token, expect=4, extra_code=fail)
+    assert codes(env["diagnostics"]) == ["write-failed"]
+    assert env["apply"] is True and env["result"] is None
+    assert env["status"]["state"] == "recovery-required"
+    plan = plan_op("recover", pi_agent)["plan"]
+    confirm_op("recover", pi_agent, plan["confirmation_token"])
+    assert status(pi_agent)["status"]["state"] == "not-installed"
+
+
+def test_windows_beta_is_a_diagnostic(pi_agent):
+    env = _ok_json(
+        ["--dry-run", "--json", "--pi-dir", str(pi_agent)],
+        0,
+        extra_code="cli._is_windows_platform = lambda: True\n",
+    )
+    assert codes(env["diagnostics"]) == ["windows-beta"]
+
+
+def test_missing_pi_dir_blocks_writes(tmp_path):
+    missing = tmp_path / "nope"
+    assert codes(plan_deploy(missing, expect=1)["diagnostics"]) == ["pi-dir-missing"]
+    assert "pi-dir-missing" in plan_op("recover", missing, expect=1)["plan"]["blockers"]
+    env = confirm_deploy(missing, "0" * 64, expect=3)
+    assert codes(env["diagnostics"]) == ["preview-token-mismatch"]
+    assert not missing.exists()
+
+
+def test_invalid_name_and_file(pi_agent, tmp_path):
+    env = _ok_json(["--dry-run", "--json", "--pi-dir", str(pi_agent), "--name", "../x"], 2)
+    assert codes(env["diagnostics"]) == ["name-invalid"]
+    env = _ok_json(["--dry-run", "--json", "--pi-dir", str(pi_agent), "--file", str(tmp_path / "nope.md")], 2)
+    assert codes(env["diagnostics"]) == ["prompt-file-invalid"]
+
+
+def test_zh_cn_diagnostics_keep_english_codes(pi_agent):
+    env = _ok_json(["--dry-run", "--json", "--pi-dir", str(pi_agent / "missing"), "--lang", "zh-CN"], 1)
+    code, _, sentence = env["diagnostics"][0].partition(": ")
+    assert code == "pi-dir-missing"
+    assert "不存在" in sentence
+
+
+# ─── Human-mode paths ────────────────────────────────────────────────────────
+@pytest.mark.parametrize("lang", ["en", "zh-CN"])
+def test_human_mode_full_cycle(run, pi_agent, lang, tmp_path):
+    custom = tmp_path / "c.md"
+    custom.write_text("C\n", encoding="utf-8")
+    _, out, _ = run(["--pi-dir", str(pi_agent), "--file", str(custom), "--lang", lang])
+    assert "--expected-preview-token" in out
+    token = out.strip().splitlines()[-1].split()[-1]
+    run(["--pi-dir", str(pi_agent), "--file", str(custom), "--yes", "--expected-preview-token", token, "--lang", lang])
+    (pi_agent / "AGENTS.md").write_text("later\n", encoding="utf-8")
+    _, out, _ = run(["--pi-dir", str(pi_agent), "--status", "--lang", lang])
+    assert "active-aligned" in out
+    _, out, _ = run(["--pi-dir", str(pi_agent), "--uninstall", "--lang", lang])
+    assert "preserved-changed" in out
+    run(["--pi-dir", str(pi_agent), "--uninstall", "--yes", "--lang", lang])
+    _, out, _ = run(["--pi-dir", str(pi_agent), "--recover", "--yes", "--lang", lang])
+    assert out.strip()
+
+
+def test_human_mode_recover_and_blockers(run, pi_agent, cli):
+    simulate_journal(cli, pi_agent)
+    code, out, _ = run(["--pi-dir", str(pi_agent)], expect_code=1)
+    assert "residue-present" in out
+    run(["--pi-dir", str(pi_agent), "--recover", "--yes", "--lang", "en"])
+    code, out, _ = run(["--pi-dir", str(pi_agent), "--status", "--lang", "en"])
+    assert "Deployability: ready" in out
+
+
+def test_human_mode_token_mismatch(run, pi_agent):
+    code, out, _ = run(["--pi-dir", str(pi_agent), "--yes", "--expected-preview-token", "0" * 64, "--lang", "en"], expect_code=3)
+    assert "preview-token-mismatch" in out
+
+
+def test_human_mode_usage_error(run, pi_agent):
+    code, out, err = run(["--pi-dir", str(pi_agent), "--status", "--expected-preview-token", "0" * 64], expect_code=2)
+    assert "preview-token-unexpected" in err and out == ""
+
+
+def test_lang_resolution(cli, monkeypatch):
+    for env, expected in (("zh_CN.UTF-8", "zh-CN"), ("en_US.UTF-8", "en"), ("fr_FR.UTF-8", "zh-CN")):
+        monkeypatch.setenv("LC_ALL", env)
+        assert cli._resolve_output_language("auto") == expected
+    assert cli._language_from_argv(["--lang=en"]) == "en"
+    assert cli._language_from_argv(["--lang"]) == "auto"
