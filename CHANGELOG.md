@@ -9,7 +9,7 @@ Formal release status is established only when a source commit is bound to an
 immutable tag, a GitHub Release, and assets matching `SHA256SUMS`. A floating
 branch or embedded version string is not sufficient.
 
-## [0.2.0] — Unreleased
+## [0.2.0] — 2026-10-12
 
 ### Added
 
