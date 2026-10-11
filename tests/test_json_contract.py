@@ -33,7 +33,7 @@ def _invoke(args, *, extra_code: str = ""):
         cmd = [sys.executable, "-c", script, *args]
     else:
         cmd = [sys.executable, str(CLI_PATH), *args]
-    proc = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=str(REPO_ROOT))
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env, cwd=str(REPO_ROOT))
     envelope = json.loads(proc.stdout) if "--json" in args and proc.stdout else None
     return proc.returncode, envelope, proc.stderr
 
@@ -91,7 +91,8 @@ def snapshot(pi_dir: Path):
 
 
 def codes(diagnostics):
-    return [d.split(":", 1)[0] for d in diagnostics]
+    """Diagnostic codes, minus the platform notice that every Windows deploy carries."""
+    return [d.split(":", 1)[0] for d in diagnostics if not d.startswith("windows-beta:")]
 
 
 def simulate_journal(cli, pi_dir: Path, phase: str = "initializing") -> Path:
@@ -640,13 +641,18 @@ def test_residue_and_marker_edge_cases(pi_agent, cli):
     assert {"residue-not-regular", "journal-invalid"} <= set(st["conflicts"])
 
 
-def test_special_nodes_and_manifest_dir(pi_agent):
+def test_manifest_directory_is_conflict(pi_agent):
     (pi_agent / MANIFEST_NAME).mkdir()
-    os.mkfifo(str(pi_agent / "CLAUDE.md"))
     st = status(pi_agent, expect=1)["status"]
     assert st["nodes"]["manifest"]["kind"] == "directory"
-    assert st["nodes"]["claude_md"]["kind"] == "special"
     assert "manifest-not-regular" in st["conflicts"]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a FIFO")
+def test_special_node_blocks_deploy(pi_agent):
+    os.mkfifo(str(pi_agent / "CLAUDE.md"))
+    st = status(pi_agent)["status"]
+    assert st["nodes"]["claude_md"]["kind"] == "special"
     assert "preserved-not-regular:claude_md" in st["blockers"]["deploy"]
 
 
@@ -697,7 +703,7 @@ def test_windows_beta_is_a_diagnostic(pi_agent):
         0,
         extra_code="cli._is_windows_platform = lambda: True\n",
     )
-    assert codes(env["diagnostics"]) == ["windows-beta"]
+    assert [d.split(":", 1)[0] for d in env["diagnostics"]] == ["windows-beta"]
 
 
 def test_missing_pi_dir_blocks_writes(tmp_path):

@@ -374,6 +374,12 @@ class IntegrityConflict(OSError):
     pass
 
 
+# Windows opens descriptors in text mode unless O_BINARY is set, which would
+# rewrite newlines and break byte-exact fingerprints.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
 def _is_regular_path(path: Path) -> bool:
     try:
         if os.path.islink(path):
@@ -403,7 +409,7 @@ def _sha256_bytes(data: bytes) -> str:
 def _read_regular_bytes_with_fingerprint(path: Path) -> Tuple[bytes, Dict[str, Any]]:
     fd = -1
     try:
-        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(str(path), os.O_RDONLY | _O_NOFOLLOW | _O_BINARY)
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise IntegrityConflict(f"{path}: not a regular file")
@@ -523,7 +529,7 @@ class _PosixFilesystem:
                 raise FilesystemError(f"{path}: chmod 0700 failed: {exc}") from exc
 
     def open_exclusive_private_file(self, path: Path) -> int:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_BINARY
         return os.open(str(path), flags, 0o600)
 
     def write_private_text(self, path: Path, content: str) -> None:
@@ -1763,7 +1769,7 @@ class _DirectoryLock:
 
     def __enter__(self) -> "_DirectoryLock":
         try:
-            self.fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            self.fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT | _O_NOFOLLOW | _O_BINARY, 0o600)
             if not stat.S_ISREG(os.fstat(self.fd).st_mode):
                 raise IntegrityConflict(f"{LOCK_FILENAME}: not a regular file")
         except OSError as exc:

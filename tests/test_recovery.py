@@ -13,7 +13,7 @@ JOURNAL_PREFIX = ".pi-keysmith-transaction-"
 
 
 def _run(args, **kw):
-    return subprocess.run([sys.executable, str(CLI_PATH), *args], capture_output=True, text=True, **kw)
+    return subprocess.run([sys.executable, str(CLI_PATH), *args], capture_output=True, text=True, encoding="utf-8", **kw)
 
 
 def _status(pi_agent: Path) -> str:

@@ -27,14 +27,14 @@ def _deploy(pi_agent: Path, extra=None) -> tuple[int, str]:
     args = ["--pi-dir", str(pi_agent), "--yes", "--lang", "en"]
     if extra:
         args.extend(extra)
-    proc = subprocess.run([sys.executable, str(CLI_PATH), *args], capture_output=True, text=True)
+    proc = subprocess.run([sys.executable, str(CLI_PATH), *args], capture_output=True, text=True, encoding="utf-8")
     return proc.returncode, proc.stdout + proc.stderr
 
 
 def _status(pi_agent: Path) -> str:
     proc = subprocess.run(
         [sys.executable, str(CLI_PATH), "--pi-dir", str(pi_agent), "--status", "--lang", "en"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
     )
     return proc.stdout + proc.stderr
 
@@ -43,7 +43,7 @@ def _uninstall(pi_agent: Path, yes=True) -> int:
     args = ["--pi-dir", str(pi_agent), "--uninstall", "--lang", "en"]
     if yes:
         args.append("--yes")
-    proc = subprocess.run([sys.executable, str(CLI_PATH), *args], capture_output=True, text=True)
+    proc = subprocess.run([sys.executable, str(CLI_PATH), *args], capture_output=True, text=True, encoding="utf-8")
     return proc.returncode
 
 
@@ -51,7 +51,7 @@ def _recover(pi_agent: Path, yes=True) -> int:
     args = ["--pi-dir", str(pi_agent), "--recover", "--lang", "en"]
     if yes:
         args.append("--yes")
-    proc = subprocess.run([sys.executable, str(CLI_PATH), *args], capture_output=True, text=True)
+    proc = subprocess.run([sys.executable, str(CLI_PATH), *args], capture_output=True, text=True, encoding="utf-8")
     return proc.returncode
 
 
@@ -154,7 +154,7 @@ def test_uninstall_preview_writes_nothing(pi_agent):
     _deploy(pi_agent)
     proc = subprocess.run(
         [sys.executable, str(CLI_PATH), "--pi-dir", str(pi_agent), "--uninstall", "--lang", "en"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8",
     )
     assert proc.returncode == 0
     assert (pi_agent / SYSTEM_NAME).exists()
