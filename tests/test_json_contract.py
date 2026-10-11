@@ -116,7 +116,7 @@ def _missing(tmp_path, cli):
 
 def _file(tmp_path, cli):
     path = tmp_path / "agent"
-    path.write_text("x", encoding="utf-8")
+    path.write_bytes(b"x")
     return path
 
 
@@ -128,7 +128,7 @@ def _empty(tmp_path, cli):
 
 def _handwritten(tmp_path, cli):
     path = _empty(tmp_path, cli)
-    (path / SYSTEM_NAME).write_text("MINE\n", encoding="utf-8")
+    (path / SYSTEM_NAME).write_bytes(b"MINE\n")
     return path
 
 
@@ -140,20 +140,20 @@ def _aligned(tmp_path, cli):
 
 def _drift(tmp_path, cli):
     path = _aligned(tmp_path, cli)
-    (path / SYSTEM_NAME).write_text("EDITED\n", encoding="utf-8")
+    (path / SYSTEM_NAME).write_bytes(b"EDITED\n")
     return path
 
 
 def _bad_manifest(tmp_path, cli):
     path = _empty(tmp_path, cli)
-    (path / MANIFEST_NAME).write_text("{not json", encoding="utf-8")
+    (path / MANIFEST_NAME).write_bytes(b"{not json")
     return path
 
 
 def _system_symlink(tmp_path, cli):
     path = _empty(tmp_path, cli)
     target = tmp_path / "elsewhere.md"
-    target.write_text("T\n", encoding="utf-8")
+    target.write_bytes(b"T\n")
     (path / SYSTEM_NAME).symlink_to(target)
     return path
 
@@ -166,7 +166,7 @@ def _journal(tmp_path, cli):
 
 def _temp_only(tmp_path, cli):
     path = _empty(tmp_path, cli)
-    (path / ".keysmith-abc123").write_text("partial", encoding="utf-8")
+    (path / ".keysmith-abc123").write_bytes(b"partial")
     return path
 
 
@@ -180,7 +180,7 @@ def _bad_journal(tmp_path, cli):
     path = _empty(tmp_path, cli)
     jdir = path / f"{JOURNAL_PREFIX}{TID}"
     jdir.mkdir()
-    (jdir / "journal.json").write_text("{broken", encoding="utf-8")
+    (jdir / "journal.json").write_bytes(b"{broken")
     return path
 
 
@@ -251,7 +251,7 @@ def test_pi_dir_symlink_reports_directory(tmp_path):
 def test_agents_md_symlink_blocks_deploy_only(pi_agent, tmp_path):
     deploy(pi_agent)
     target = tmp_path / "dotfiles-agents.md"
-    target.write_text("A\n", encoding="utf-8")
+    target.write_bytes(b"A\n")
     (pi_agent / "AGENTS.md").symlink_to(target)
     st = status(pi_agent)["status"]
     assert st["state"] != "conflict"
@@ -292,7 +292,7 @@ def test_deploy_preview_is_stable_and_writes_nothing(pi_agent, cli, tmp_path):
     assert [w["action"] for w in plan["writes"]] == ["create", "create"]
     assert plan_deploy(pi_agent)["plan"]["confirmation_token"] == plan["confirmation_token"]
     custom = tmp_path / "custom.md"
-    custom.write_text("CUSTOM\n", encoding="utf-8")
+    custom.write_bytes(b"CUSTOM\n")
     a = plan_deploy(pi_agent, extra=["--file", str(custom), "--name", "one"])["plan"]
     b = plan_deploy(pi_agent, extra=["--file", str(custom), "--name", "two"])["plan"]
     assert a["prompt"]["sha256"] == hashlib.sha256(b"CUSTOM\n").hexdigest()
@@ -317,9 +317,9 @@ def test_deploy_confirm_writes_and_aligns(pi_agent):
 
 # ─── 6. token mismatch ───────────────────────────────────────────────────────
 def test_token_mismatch_after_system_edit(pi_agent):
-    (pi_agent / SYSTEM_NAME).write_text("ONE\n", encoding="utf-8")
+    (pi_agent / SYSTEM_NAME).write_bytes(b"ONE\n")
     token = plan_deploy(pi_agent)["plan"]["confirmation_token"]
-    (pi_agent / SYSTEM_NAME).write_text("TWO\n", encoding="utf-8")
+    (pi_agent / SYSTEM_NAME).write_bytes(b"TWO\n")
     before = snapshot(pi_agent)
     env = confirm_deploy(pi_agent, token, expect=3)
     assert codes(env["diagnostics"]) == ["preview-token-mismatch"]
@@ -328,11 +328,11 @@ def test_token_mismatch_after_system_edit(pi_agent):
 
 
 def test_token_mismatch_after_backup_tamper(pi_agent):
-    (pi_agent / SYSTEM_NAME).write_text("ORIGINAL\n", encoding="utf-8")
+    (pi_agent / SYSTEM_NAME).write_bytes(b"ORIGINAL\n")
     deploy(pi_agent)
     token = plan_op("uninstall", pi_agent)["plan"]["confirmation_token"]
     backup = next(p for p in pi_agent.iterdir() if p.name.startswith("SYSTEM.md.bak_"))
-    backup.write_text("TAMPERED\n", encoding="utf-8")
+    backup.write_bytes(b"TAMPERED\n")
     before = snapshot(pi_agent)
     confirm_op("uninstall", pi_agent, token, expect=3)
     assert snapshot(pi_agent) == before
@@ -375,8 +375,8 @@ def test_usage_errors_emit_envelope(args, code, pi_agent):
 
 # ─── 8. uninstall ────────────────────────────────────────────────────────────
 def test_uninstall_restores_and_archives(pi_agent):
-    (pi_agent / SYSTEM_NAME).write_text("ORIGINAL\n", encoding="utf-8")
-    (pi_agent / "APPEND_SYSTEM.md").write_text("PERSONA\n", encoding="utf-8")
+    (pi_agent / SYSTEM_NAME).write_bytes(b"ORIGINAL\n")
+    (pi_agent / "APPEND_SYSTEM.md").write_bytes(b"PERSONA\n")
     deploy(pi_agent)
     plan = plan_op("uninstall", pi_agent)["plan"]
     assert [w["action"] for w in plan["writes"]] == ["restore", "archive"]
@@ -401,7 +401,7 @@ def test_uninstall_blocked_by_previous_manifest_backup_mismatch(pi_agent):
     deploy(pi_agent)
     deploy(pi_agent)
     backup = next(p for p in pi_agent.iterdir() if p.name.startswith(f"{MANIFEST_NAME}.bak_"))
-    backup.write_text(backup.read_text(encoding="utf-8") + " ", encoding="utf-8")
+    backup.write_bytes(backup.read_bytes() + b" ")
     st = status(pi_agent)["status"]
     assert "manifest-backup-mismatch" in st["blockers"]["uninstall"]
     before = snapshot(pi_agent)
@@ -411,9 +411,9 @@ def test_uninstall_blocked_by_previous_manifest_backup_mismatch(pi_agent):
 
 
 def test_uninstall_preview_warns_on_preserved_change(pi_agent):
-    (pi_agent / "AGENTS.md").write_text("A\n", encoding="utf-8")
+    (pi_agent / "AGENTS.md").write_bytes(b"A\n")
     deploy(pi_agent)
-    (pi_agent / "AGENTS.md").write_text("B\n", encoding="utf-8")
+    (pi_agent / "AGENTS.md").write_bytes(b"B\n")
     env = plan_op("uninstall", pi_agent)
     assert env["status"]["preserved_changed"] == ["agents_md"]
     assert "preserved-changed" in codes(env["diagnostics"])
@@ -437,7 +437,7 @@ KILL_AFTER_COMMIT = "import os\ncli._cleanup_journal = lambda *a, **k: os._exit(
 
 @pytest.mark.parametrize("phase", ["manifest-intent", "final-sweep"])
 def test_recover_rolls_back_unfinished_deploy(pi_agent, phase):
-    (pi_agent / SYSTEM_NAME).write_text("ORIGINAL\n", encoding="utf-8")
+    (pi_agent / SYSTEM_NAME).write_bytes(b"ORIGINAL\n")
     token = plan_deploy(pi_agent)["plan"]["confirmation_token"]
     code, _, _ = _invoke(
         ["--yes", "--json", "--pi-dir", str(pi_agent), "--expected-preview-token", token],
@@ -551,8 +551,8 @@ def test_lock_busy(pi_agent):
 
 # ─── 12. stdout hygiene and end-to-end flow ──────────────────────────────────
 def test_full_flow_preserves_neighbors(pi_agent):
-    (pi_agent / "APPEND_SYSTEM.md").write_text("PERSONA\n", encoding="utf-8")
-    (pi_agent / "AGENTS.md").write_text("AGENTS\n", encoding="utf-8")
+    (pi_agent / "APPEND_SYSTEM.md").write_bytes(b"PERSONA\n")
+    (pi_agent / "AGENTS.md").write_bytes(b"AGENTS\n")
     preserved = {n: (pi_agent / n).read_bytes() for n in ("APPEND_SYSTEM.md", "AGENTS.md")}
     assert status(pi_agent)["status"]["state"] == "not-installed"
     deploy(pi_agent)
@@ -608,7 +608,7 @@ def test_tampered_interrupted_cleanup_is_conflict(pi_agent, cli):
     kill = "import os\ncli._remove_journal_dir = lambda *a, **k: os._exit(9)\n"
     _invoke(["--yes", "--json", "--pi-dir", str(pi_agent), "--expected-preview-token", token], extra_code=kill)
     jdir = next(p for p in pi_agent.iterdir() if p.name.startswith(JOURNAL_PREFIX))
-    (jdir / "extra").write_text("x", encoding="utf-8")
+    (jdir / "extra").write_bytes(b"x")
     st = status(pi_agent, expect=1)["status"]
     assert st["state"] == "conflict" and "journal-invalid" in st["conflicts"]
     assert plan_op("recover", pi_agent, expect=1)["plan"]["writes"] == []
@@ -626,7 +626,7 @@ def test_two_unfinished_journals_are_ambiguous(pi_agent, cli):
 
 def test_unexpected_resource_blocks_recover(pi_agent, cli):
     simulate_journal(cli, pi_agent)
-    (pi_agent / SYSTEM_NAME).write_text("SOMEONE ELSE\n", encoding="utf-8")
+    (pi_agent / SYSTEM_NAME).write_bytes(b"SOMEONE ELSE\n")
     st = status(pi_agent, expect=1)["status"]
     assert "recover-resource-unexpected:system" in st["conflicts"]
     env = plan_op("recover", pi_agent, expect=1)
@@ -635,8 +635,8 @@ def test_unexpected_resource_blocks_recover(pi_agent, cli):
 
 def test_residue_and_marker_edge_cases(pi_agent, cli):
     (pi_agent / ".keysmith-dir").mkdir()
-    (pi_agent / f".pi-keysmith-cleanup-{TID}.intent.json").write_text("{broken", encoding="utf-8")
-    (pi_agent / f"{JOURNAL_PREFIX}notadir").write_text("x", encoding="utf-8")
+    (pi_agent / f".pi-keysmith-cleanup-{TID}.intent.json").write_bytes(b"{broken")
+    (pi_agent / f"{JOURNAL_PREFIX}notadir").write_bytes(b"x")
     st = status(pi_agent, expect=1)["status"]
     assert {"residue-not-regular", "journal-invalid"} <= set(st["conflicts"])
 
@@ -657,7 +657,7 @@ def test_special_node_blocks_deploy(pi_agent):
 
 
 def test_backup_missing_blocks_uninstall(pi_agent):
-    (pi_agent / SYSTEM_NAME).write_text("ORIGINAL\n", encoding="utf-8")
+    (pi_agent / SYSTEM_NAME).write_bytes(b"ORIGINAL\n")
     deploy(pi_agent)
     deploy(pi_agent)
     for p in list(pi_agent.iterdir()):
@@ -724,7 +724,8 @@ def test_invalid_name_and_file(pi_agent, tmp_path):
 
 def test_zh_cn_diagnostics_keep_english_codes(pi_agent):
     env = _ok_json(["--dry-run", "--json", "--pi-dir", str(pi_agent / "missing"), "--lang", "zh-CN"], 1)
-    code, _, sentence = env["diagnostics"][0].partition(": ")
+    diagnostic = next(d for d in env["diagnostics"] if not d.startswith("windows-beta:"))
+    code, _, sentence = diagnostic.partition(": ")
     assert code == "pi-dir-missing"
     assert "不存在" in sentence
 
@@ -733,12 +734,12 @@ def test_zh_cn_diagnostics_keep_english_codes(pi_agent):
 @pytest.mark.parametrize("lang", ["en", "zh-CN"])
 def test_human_mode_full_cycle(run, pi_agent, lang, tmp_path):
     custom = tmp_path / "c.md"
-    custom.write_text("C\n", encoding="utf-8")
+    custom.write_bytes(b"C\n")
     _, out, _ = run(["--pi-dir", str(pi_agent), "--file", str(custom), "--lang", lang])
     assert "--expected-preview-token" in out
     token = out.strip().splitlines()[-1].split()[-1]
     run(["--pi-dir", str(pi_agent), "--file", str(custom), "--yes", "--expected-preview-token", token, "--lang", lang])
-    (pi_agent / "AGENTS.md").write_text("later\n", encoding="utf-8")
+    (pi_agent / "AGENTS.md").write_bytes(b"later\n")
     _, out, _ = run(["--pi-dir", str(pi_agent), "--status", "--lang", lang])
     assert "active-aligned" in out
     _, out, _ = run(["--pi-dir", str(pi_agent), "--uninstall", "--lang", lang])

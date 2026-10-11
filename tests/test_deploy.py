@@ -80,8 +80,8 @@ def test_deploy_creates_system_md_and_manifest(pi_agent):
 
 
 def test_deploy_preserves_append_system_and_agents_md(pi_agent):
-    (pi_agent / "APPEND_SYSTEM.md").write_text("PERSONA-CARD\n", encoding="utf-8")
-    (pi_agent / "AGENTS.md").write_text("GLOBAL-INSTRUCTIONS\n", encoding="utf-8")
+    (pi_agent / "APPEND_SYSTEM.md").write_bytes(b"PERSONA-CARD\n")
+    (pi_agent / "AGENTS.md").write_bytes(b"GLOBAL-INSTRUCTIONS\n")
     persona_before = (pi_agent / "APPEND_SYSTEM.md").read_bytes()
     agents_before = (pi_agent / "AGENTS.md").read_bytes()
     code, out = _deploy(pi_agent)
@@ -163,7 +163,7 @@ def test_uninstall_preview_writes_nothing(pi_agent):
 
 def test_custom_prompt_deploy(run, pi_agent, tmp_path):
     custom = tmp_path / "custom.md"
-    custom.write_text("CUSTOM-PROMPT-CONTENT\n", encoding="utf-8")
+    custom.write_bytes(b"CUSTOM-PROMPT-CONTENT\n")
     code, out, _ = run(["--pi-dir", str(pi_agent), "--yes", "--file", str(custom), "--name", "custom-rules", "--lang", "en"])
     assert code == 0
     # Deploy target is always SYSTEM.md, regardless of --name.

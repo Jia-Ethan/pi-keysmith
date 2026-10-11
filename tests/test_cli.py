@@ -46,21 +46,21 @@ def test_status_rejects_yes(run, pi_agent):
 
 def test_status_rejects_explicit_file(run, pi_agent, tmp_path):
     f = tmp_path / "p.md"
-    f.write_text("x", encoding="utf-8")
+    f.write_bytes(b"x")
     code, out, err = run(["--pi-dir", str(pi_agent), "--status", "--file", str(f)], expect_code=2)
     assert code == 2
 
 
 def test_uninstall_rejects_file(run, pi_agent, tmp_path):
     f = tmp_path / "p.md"
-    f.write_text("x", encoding="utf-8")
+    f.write_bytes(b"x")
     code, out, err = run(["--pi-dir", str(pi_agent), "--uninstall", "--file", str(f)], expect_code=2)
     assert code == 2
 
 
 def test_recover_rejects_file(run, pi_agent, tmp_path):
     f = tmp_path / "p.md"
-    f.write_text("x", encoding="utf-8")
+    f.write_bytes(b"x")
     code, out, err = run(["--pi-dir", str(pi_agent), "--recover", "--file", str(f)], expect_code=2)
     assert code == 2
 
