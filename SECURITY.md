@@ -31,5 +31,6 @@ deploy your own `--file`.
 
 ## Supported versions
 
-Only the latest signed Release is supported. Candidate builds and the
-floating `main` branch are development state and are not formally supported.
+Only the latest GitHub Release is supported; verify its assets against
+`SHA256SUMS`. Candidate builds and the floating `main` branch are development
+state and are not formally supported.
