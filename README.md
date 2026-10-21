@@ -35,6 +35,21 @@ uninstall, and recover. Confirmed writes need `--yes` plus the preview's
 `--expected-preview-token`. The full contract (argv, states, codes, token,
 exit codes) is in [docs/json-contract.md](docs/json-contract.md).
 
+## Prompt evals
+
+The bundled prompt is covered by a behavioural regression gate: six cases run
+the real agent in isolated workspaces and assert on the files it changed, not
+on what it claims it did.
+
+```bash
+npm install -g promptfoo@0.124.1
+promptfoo eval -c evals/promptfooconfig.yaml
+```
+
+See [evals/README.md](evals/README.md) for the contract list, isolation model,
+and how to add a case. CI runs the same suite weekly and on PRs that touch the
+prompt.
+
 ## Docs
 
 - [docs/json-contract.md](docs/json-contract.md) — `--json` contract used by Keysmith Switch

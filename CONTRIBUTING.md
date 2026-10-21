@@ -23,12 +23,22 @@ Contributions are welcome. Read this document before opening a pull request.
    python3 -m ruff check pi-keysmith.py tests scripts
    ```
 
-3. Add tests for any behavioral change. The bundled prompt in the script must
+3. If you touch `examples/system-prompt.md` (or the embedded copy), run the
+   prompt evals as well:
+
+   ```bash
+   promptfoo eval -c evals/promptfooconfig.yaml
+   ```
+
+   A red case means the prompt's stated behaviour no longer holds; fix the
+   prompt rather than the assertion.
+
+4. Add tests for any behavioral change. The bundled prompt in the script must
    remain byte-identical to `examples/system-prompt.md`; the parity test
    enforces this.
-4. Keep the bilingual (`zh-CN` / `en`) CLI strings in sync when you change
+5. Keep the bilingual (`zh-CN` / `en`) CLI strings in sync when you change
    user-facing output.
-5. Open a PR with a clear description of the change, the risk surface, and the
+6. Open a PR with a clear description of the change, the risk surface, and the
    verification evidence.
 
 ## Commit and PR conventions

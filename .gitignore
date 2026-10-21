@@ -16,3 +16,7 @@ work/
 # OS / editor
 .DS_Store
 *.swp
+
+# Prompt eval output
+evals/out/
+.promptfoo/
