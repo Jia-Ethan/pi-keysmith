@@ -1,0 +1,122 @@
+name: prompt-eval
+
+# Behavioural regression gate for the bundled system prompt.
+# See evals/README.md. Costs real tokens: runs are capped and skipped
+# entirely when no provider credentials are configured.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 1 * * 1"
+  pull_request:
+    paths:
+      - "examples/system-prompt.md"
+      - "pi-keysmith.py"
+      - "evals/**"
+      - ".github/workflows/prompt-eval.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  prompt-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check eval credentials
+        id: creds
+        env:
+          PROVIDER: ${{ vars.PI_EVAL_PROVIDER }}
+          MODEL: ${{ vars.PI_EVAL_MODEL }}
+          ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DEEPSEEK_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          if [ -z "$PROVIDER" ] || [ -z "$MODEL" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::PI_EVAL_PROVIDER / PI_EVAL_MODEL repo variables not set - skipping prompt eval"
+            exit 0
+          fi
+          if [ -z "$ANTHROPIC_KEY" ] && [ -z "$OPENAI_KEY" ] && [ -z "$DEEPSEEK_KEY" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no provider API key secret configured - skipping prompt eval"
+            exit 0
+          fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      - name: Install tooling
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          npm install -g promptfoo@0.124.1 @earendil-works/pi-coding-agent@1.3.0
+
+      - name: Run prompt evals
+        if: steps.creds.outputs.available == 'true'
+        env:
+          PI_EVAL_PROVIDER: ${{ vars.PI_EVAL_PROVIDER }}
+          PI_EVAL_MODEL: ${{ vars.PI_EVAL_MODEL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          PROMPTFOO_DISABLE_TELEMETRY: "1"
+          PROMPTFOO_DISABLE_UPDATE: "1"
+        run: |
+          set +e
+          mkdir -p evals/out
+          promptfoo eval -c evals/promptfooconfig.yaml \
+            --max-concurrency 2 \
+            --no-cache \
+            -o evals/out/results.json
+          code=$?
+          set -e
+          # 100 = assertions failed; anything else is an infrastructure error.
+          if [ "$code" -eq 100 ]; then
+            echo "::error::bundled prompt regressed - see the summary below"
+            exit 1
+          elif [ "$code" -ne 0 ]; then
+            echo "::error::prompt eval failed to run (exit $code)"
+            exit "$code"
+          fi
+
+      - name: Summarise results
+        if: always() && steps.creds.outputs.available == 'true'
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, pathlib
+          p = pathlib.Path("evals/out/results.json")
+          if not p.exists():
+              print("No results file produced.")
+              raise SystemExit(0)
+          data = json.loads(p.read_text())
+          rows = data["results"]["results"]
+          print("| Case | Result |")
+          print("| --- | --- |")
+          failed = 0
+          for r in rows:
+              g = r.get("gradingResult") or {}
+              ok = bool(g.get("pass"))
+              failed += 0 if ok else 1
+              print(f"| {r['testCase']['description']} | {'PASS' if ok else 'FAIL'} |")
+          print(f"\n{len(rows) - failed}/{len(rows)} passed.")
+          for r in rows:
+              g = r.get("gradingResult") or {}
+              if not g.get("pass"):
+                  print(f"\n**{r['testCase']['description']}** — {g.get('reason', '')}")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.creds.outputs.available == 'true'
+        with:
+          name: prompt-eval-results
+          path: evals/out/results.json
+          if-no-files-found: warn
