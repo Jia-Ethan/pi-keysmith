@@ -38,7 +38,9 @@ branch or embedded version string is not sufficient.
   replace.
 - `--dry-run --yes` is a preview.
 
-## [0.1.0] — Unreleased
+## [0.1.0] — Not released
+
+Never tagged or published; superseded by 0.2.0, the first public release.
 
 ### Added
 
@@ -74,4 +76,3 @@ branch or embedded version string is not sufficient.
 - Backups and uninstall archives are not automatically cleaned.
 
 [0.2.0]: https://github.com/Jia-Ethan/pi-keysmith/releases/tag/v0.2.0
-[0.1.0]: https://github.com/Jia-Ethan/pi-keysmith/releases/tag/v0.1.0
